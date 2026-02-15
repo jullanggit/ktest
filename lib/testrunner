@@ -33,7 +33,8 @@ ktest_no_cleanup_tmpdir=1
 log_verbose "Testrunner starting"
 
 mkdir -p /root/.ssh
-if cat /host/$home/.ssh/id*.pub > /root/.ssh/authorized_keys; then
+
+if cat /host/nix/store/x1anp4vb8xfvd9syxy08mim20dn8njmv-user-ssh_id_ed25519.pub > /root/.ssh/authorized_keys; then
     chmod 600 /root/.ssh/authorized_keys || true
 else
     echo "Create an ssh key for ssh access"
@@ -112,7 +113,7 @@ echo "$local_ip" "$(hostname)" >> /etc/hosts
 get_stratch_devs()
 {
     echo
-    sfdisk -X gpt /dev/sdb 
+    sfdisk -X gpt /dev/sdb
 }
 
 copy_to_host()
