@@ -7,7 +7,7 @@
 . $(dirname $(readlink -e "${BASH_SOURCE[0]}"))/../../test-libs.sh
 
 if $ktest_interactive; then
-    require-git https://evilpiepirate.org/git/bcachefs-tools.git
+    # require-git https://evilpiepirate.org/git/bcachefs-tools.git
     init_build_bcachefs_tools() {
 	cd $ktest_dir/tests/fs/bcachefs/bcachefs-tools
 	local jobs=$(( $(nproc) / 2 ))
