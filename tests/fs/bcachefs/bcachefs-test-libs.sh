@@ -49,7 +49,7 @@ require-kernel-config BCACHEFS_TESTS
 ktest_bcachefs_tests=1
 export BCACHEFS_TESTS=1
 
-require-git https://evilpiepirate.org/git/bcachefs-tools.git
+# require-git https://evilpiepirate.org/git/bcachefs-tools.git
 # Cache key for the bcachefs DKMS module. The built .ko is fully
 # determined by the kernel it compiles against (version + config), the
 # bcachefs-tools revision, and the build flags — key on exactly that.
