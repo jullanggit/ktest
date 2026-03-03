@@ -1,0 +1,479 @@
+ ./build-test-kernel run -I -K -k ../bcachefs tests/fs/bcachefs/shrink.ktest
+Running test shrink.ktest on pc at /etc/nixos/home/data/Code/bcachefs/ktest
+building kernel... done
+Kernel version: 6.17.0-g369a18490dcb
+hook init_build_bcachefs_tools
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+    [SED]    initramfs/hook
+fatal: No names found, cannot describe anything.
+    [SED]    dkms/dkms.conf
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+fatal: No names found, cannot describe anything.
+install -m0644 -D dkms/Makefile         -t /usr/src/bcachefs-
+install -m0644 -D dkms/dkms.conf                -t /usr/src/bcachefs-
+install -m0644 -D libbcachefs/Makefile  -t /usr/src/bcachefs-/src/fs/bcachefs
+(cd libbcachefs; find -name '*.[ch]' -exec install -m0644 -D {} /usr/src/bcachefs-/src/fs/bcachefs/{} \; )
+install -m0644 -D dkms/module-version.c -t /usr/src/bcachefs-/src/fs/bcachefs
+install -m0644 -D version.h                     -t /usr/src/bcachefs-/src/fs/bcachefs
+sed -i "s|^#define TRACE_INCLUDE_PATH \\.\\./\\.\\./fs/bcachefs$|#define TRACE_INCLUDE_PATH .|" \
+  /usr/src/bcachefs-/src/fs/bcachefs/debug/trace.h
+install -m0755 -D target/release/bcachefs  -t /sbin
+install -m0644 -D bcachefs.8    -t /usr/share/man/man8/
+install -m0755 -D initramfs/hook   /usr/share/initramfs-tools/hooks/bcachefs
+install -m0644 -D udev/64-bcachefs.rules -t /usr/lib/udev/rules.d/
+ln -sfr /sbin/bcachefs /sbin/mkfs.bcachefs
+ln -sfr /sbin/bcachefs /sbin/fsck.bcachefs
+ln -sfr /sbin/bcachefs /sbin/mount.bcachefs
+install -d /usr/share/bash-completion/completions
+target/release/bcachefs completions bash > /usr/share/bash-completion/completions/bcachefs
+hook init_noop
+
+Running tests online_empty_shrink online_three_device_ec_shrink online_three_device_replicas_shrink online_two_device_data_shrink
+
+========= TEST   online_empty_shrink
+WATCHDOG 60
+bcachefs (vdb): Using encoding defined by superblock: utf8-12.1.0
+bcachefs (vdb): kernel does not have CONFIG_RUST enabled; this will be required for bcachefs in the near future - please alert your distribution or kernel developers if your kernel does not support CONFIG_RUST
+starting version no_sb_user_data_replicas (1.36)
+  features: new_siphash,new_extent_overwrite,btree_ptr_v2,extents_above_btree_updates,btree_updates_journalled,new_varint,journal_no_flush,alloc_v2,extents_across_btree_nodes,incompat_version_field
+bcachefs (vdb): initializing new filesystem
+bcachefs (vdb): marking superblocks
+bcachefs (vdb): going read-write
+bcachefs (vdb): initializing freespace
+bcachefs (vdb): done initializing freespace
+mount.bcachefs (1152) used greatest stack depth: 8016 bytes left
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb        931M  2.8M  914M   1% /mnt
+Doing online resize of /dev/vdb
+resizing /dev/vdb to 1000 buckets
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb        444M  3.0M  434M   1% /mnt
+bcachefs (vdb): shutting down
+bcachefs (vdb): going read-only
+bcachefs (vdb): finished waiting for writes to stop
+bcachefs (vdb): flushing journal and stopping allocators, journal seq 10
+bcachefs (vdb): flushing journal and stopping allocators complete, journal seq 10
+bcachefs (vdb): clean shutdown complete, journal seq 11
+bcachefs (vdb): shutdown complete
+Running in-kernel offline fsck
+bcachefs (vdb): Using encoding defined by superblock: utf8-12.1.0
+bcachefs (vdb): kernel does not have CONFIG_RUST enabled; this will be required for bcachefs in the near future - please alert your distribution or kernel developers if your kernel does not support CONFIG_RUST
+starting version no_sb_user_data_replicas (1.36)
+  with options: degraded=yes,fsck,fix_errors=no,noratelimit_errors,nochanges,read_only
+  features: new_siphash,new_extent_overwrite,btree_ptr_v2,extents_above_btree_updates,btree_updates_journalled,new_varint,journal_no_flush,alloc_v2,extents_across_btree_nodes,incompat_version_field
+bcachefs (vdb): recovering from clean shutdown, journal seq 11
+bcachefs (vdb): accounting_read... done (0 seconds)
+bcachefs (vdb): alloc_read... done (0 seconds)
+bcachefs (vdb): snapshots_read... done (0 seconds)
+bcachefs (vdb): check_allocations... done (0 seconds)
+bcachefs (vdb): going read-write
+bcachefs (vdb): journal_replay... done (0 seconds)
+bcachefs (vdb): check_alloc_info... done (0 seconds)
+bcachefs (vdb): check_lrus... done (0 seconds)
+bcachefs (vdb): check_btree_backpointers... done (0 seconds)
+bcachefs (vdb): check_extents_to_backpointers...bcachefs (vdb): scanning for missing backpointers in 0/1000 buckets, 7 buckets with no backpointers
+ done (0 seconds)
+bcachefs (vdb): check_alloc_to_lru_refs... done (0 seconds)
+bcachefs (vdb): check_snapshot_trees... done (0 seconds)
+bcachefs (vdb): check_snapshots... done (0 seconds)
+bcachefs (vdb): check_subvols... done (0 seconds)
+bcachefs (vdb): check_subvol_children... done (0 seconds)
+bcachefs (vdb): delete_dead_snapshots... done (0 seconds)
+bcachefs (vdb): check_inodes... done (0 seconds)
+bcachefs (vdb): check_extents... done (0 seconds)
+bcachefs (vdb): check_indirect_extents... done (0 seconds)
+bcachefs (vdb): check_dirents... done (0 seconds)
+bcachefs (vdb): check_xattrs... done (0 seconds)
+bcachefs (vdb): check_root... done (0 seconds)
+bcachefs (vdb): check_unreachable_inodes... done (0 seconds)
+bcachefs (vdb): check_subvolume_structure... done (0 seconds)
+bcachefs (vdb): check_directory_structure... done (0 seconds)
+bcachefs (vdb): check_nlinks... done (0 seconds)
+bcachefs (vdb): check_reconcile_work... done (0 seconds)
+bcachefs (vdb): resume_logged_ops... done (0 seconds)
+bcachefs (vdb): delete_dead_inodes... done (0 seconds)
+bcachefs (vdb): going read-only
+bcachefs (vdb): finished waiting for writes to stop
+bcachefs (vdb): flushing journal and stopping allocators, journal seq 12
+bcachefs (vdb): flushing journal and stopping allocators complete, journal seq 12
+bcachefs (vdb): clean shutdown complete, journal seq 13
+bcachefs (vdb): shutting down
+bcachefs (vdb): shutdown complete
+
+========= PASSED online_empty_shrink in 4s
+========= TEST   online_three_device_ec_shrink
+WATCHDOG 60
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): Using encoding defined by superblock: utf8-12.1.0
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): kernel does not have CONFIG_RUST enabled; this will be required for bcachefs in the near future - please alert your distribution or kernel developers if your kernel does not support CONFIG_RUST
+starting version no_sb_user_data_replicas (1.36)
+  features: new_siphash,new_extent_overwrite,btree_ptr_v2,extents_above_btree_updates,btree_updates_journalled,new_varint,journal_no_flush,alloc_v2,extents_across_btree_nodes,incompat_version_field
+  with devices: vdb,vdc
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): initializing new filesystem
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): marking superblocks
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): going read-write
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): initializing freespace
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): done initializing freespace
+700+0 records in
+700+0 records out
+734003200 bytes (734 MB, 700 MiB) copied, 3.69869 s, 198 MB/s
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): initializing freespace
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): done initializing freespace
+Filesystem                  Size  Used Avail Use% Mounted on
+/dev/vdb:/dev/vdc:/dev/vdd  3.7G  1.5G  2.2G  40% /mnt
+Doing online resize of /dev/vdb
+resizing /dev/vdb to 512 buckets
+Filesystem                  Size  Used Avail Use% Mounted on
+/dev/vdb:/dev/vdc:/dev/vdd  3.0G  1.7G  1.3G  57% /mnt
+Filesystem: 880f675c-a5cf-4ee7-b638-bd0413942818
+Size:2.98G
+Used:                          1.66G
+Online reserved:                282M
+
+          undegraded
+2x:            1.37G
+
+Data type      Required/total  Durability    Devices
+btree:         1/2             2             [vdb vdc]               5.00M
+btree:         1/2             2             [vdc vdd]               8.50M
+user:          1/2             2             [vdb vdc]                483M
+user:          1/2             2             [vdc vdd]                917M
+
+Btree usage:
+extents:               1.50M
+inodes:                 512k
+dirents:                512k
+alloc:                 2.00M
+subvolumes:             512k
+snapshots:              512k
+lru:                    512k
+freespace:              512k
+need_discard:           512k
+backpointers:          2.00M
+bucket_gens:            512k
+snapshot_trees:         512k
+logged_ops:             512k
+reconcile_work:         512k
+accounting:             512k
+reconcile_hipri:        512k
+reconcile_scan:         512k
+reconcile_work_phys:    512k
+reconcile_hipri_phys:   512k
+
+Pending reconcile:                      data    metadata
+erasure_code:                           700M           0
+
+(no label) (device 0):           vdb              rw    99%
+                                data         buckets    fragmented
+  free:                            0               0
+  sb:                          2.00M               5          508k
+  journal:                     8.00M              16
+  btree:                       2.50M               7         1.00M
+  user:                         241M             483
+  cached:                          0               0
+  parity:                          0               0
+  stripe:                          0               0
+  need_gc_gens:                    0               0
+  need_discard:                 512k               1
+  unstriped:                       0               0
+  capacity:                     256M             512
+  bucket size:                  512k
+
+(no label) (device 1):           vdc              rw    70%
+                                data         buckets    fragmented
+  free:                         287M             575
+  sb:                          3.00M               7          508k
+  journal:                     8.00M              16
+  btree:                       6.75M              17         1.75M
+  user:                         700M            1432         16.0M
+  cached:                          0               0
+  parity:                          0               0
+  stripe:                          0               0
+  need_gc_gens:                    0               0
+  need_discard:                 512k               1
+  unstriped:                       0               0
+  capacity:                    1.00G            2048
+  bucket size:                  512k
+
+(no label) (device 2):           vdd              rw    23%
+                                data         buckets    fragmented
+  free:                        1.51G            1548
+  sb:                          3.00M               4         1020k
+  journal:                     16.0M              16
+  btree:                       4.25M               5          768k
+  user:                         458M             475         16.5M
+  cached:                          0               0
+  parity:                          0               0
+  stripe:                          0               0
+  need_gc_gens:                    0               0
+  need_discard:                    0               0
+  unstriped:                       0               0
+  capacity:                    2.00G            2048
+  bucket size:                 1.00M
+
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): shutting down
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): going read-only
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): finished waiting for writes to stop
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): flushing journal and stopping allocators, journal seq 56
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): flushing journal and stopping allocators complete, journal seq 56
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): clean shutdown complete, journal seq 57
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): shutdown complete
+Running in-kernel offline fsck
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): Using encoding defined by superblock: utf8-12.1.0
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): kernel does not have CONFIG_RUST enabled; this will be required for bcachefs in the near future - please alert your distribution or kernel developers if your kernel does not support CONFIG_RUST
+starting version no_sb_user_data_replicas (1.36)
+  with options: degraded=yes,fsck,fix_errors=no,noratelimit_errors,nochanges,read_only
+  features: ec,new_siphash,new_extent_overwrite,btree_ptr_v2,extents_above_btree_updates,btree_updates_journalled,new_varint,journal_no_flush,alloc_v2,extents_across_btree_nodes,incompat_version_field
+  with devices: vdb,vdc,vdd
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): recovering from clean shutdown, journal seq 57
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): accounting_read... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): alloc_read... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): snapshots_read... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_allocations... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): going read-write
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): vdb has 3.50M btree buckets and 64.0M marked in bitmap
+  vdc has 8.50M btree buckets and 64.0M marked in bitmap
+  scheduling recovery pass btree_bitmap_gc (46)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): journal_replay... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_alloc_info...bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:2:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1, fixing
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:3:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1, fixing
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:4:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1, fixing
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:5:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0, fixing
+ done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_lrus... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_btree_backpointers... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_extents_to_backpointers...bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): scanning for missing backpointers in 0/4608 buckets, 490 buckets with no backpointers
+ done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_alloc_to_lru_refs... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_snapshot_trees... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_snapshots... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_subvols... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_subvol_children... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): delete_dead_snapshots... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_inodes... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_extents... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_indirect_extents... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_dirents... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_xattrs... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_root... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_unreachable_inodes... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_subvolume_structure... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_directory_structure... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_nlinks... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_reconcile_work... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): resume_logged_ops... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): delete_dead_inodes... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): Fixed errors, running fsck a second time to verify fs is clean
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_alloc_info... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_lrus... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_btree_backpointers... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_extents_to_backpointers...bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): scanning for missing backpointers in 0/4608 buckets, 0 buckets with no backpointers
+ done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_alloc_to_lru_refs... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_snapshot_trees... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_snapshots... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_subvols... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_subvol_children... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): delete_dead_snapshots... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_inodes... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_extents... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_indirect_extents... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_dirents... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_xattrs... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_root... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_unreachable_inodes... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_subvolume_structure... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_directory_structure... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_nlinks... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): check_reconcile_work... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): resume_logged_ops... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): delete_dead_inodes... done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): btree_bitmap_gc...bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): mi_btree_bitmap sectors 144M -> 80.0M
+ done (0 seconds)
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): Second fsck run was not clean
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): going read-only
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): finished waiting for writes to stop
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): flushing journal and stopping allocators, journal seq 62
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): flushing journal and stopping allocators complete, journal seq 62
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): clean shutdown complete, journal seq 63
+880f675c-a5cf-4ee7-b638-bd0413942818: errors fixed
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): shutting down
+bcachefs (880f675c-a5cf-4ee7-b638-bd0413942818): shutdown complete
+Error 1 at /host//etc/nixos/home/data/Code/bcachefs/ktest/tests/fs/bcachefs/shrink.ktest 126 from: bcachefs fsck -ny "${ktest_scratch_dev[@]}", exiting
+Error 1 at /host/etc/nixos/home/data/Code/bcachefs/ktest/tests/prelude.sh 347 from: ( set -e; run_test $i ), exiting
+
+========= FAILED online_three_device_ec_shrink in 10s
+Error 1 at /host/etc/nixos/home/data/Code/bcachefs/ktest/tests/prelude.sh 369 from: sort -r 2> /dev/null, exiting
+========= TEST   online_three_device_replicas_shrink
+WATCHDOG 60
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): Using encoding defined by superblock: utf8-12.1.0
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): kernel does not have CONFIG_RUST enabled; this will be required for bcachefs in the near future - please alert your distribution or kernel developers if your kernel does not support CONFIG_RUST
+starting version no_sb_user_data_replicas (1.36)
+  features: new_siphash,new_extent_overwrite,btree_ptr_v2,extents_above_btree_updates,btree_updates_journalled,new_varint,journal_no_flush,alloc_v2,extents_across_btree_nodes,incompat_version_field
+  with devices: vdb,vdc
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): initializing new filesystem
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): marking superblocks
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): going read-write
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): initializing freespace
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): done initializing freespace
+700+0 records in
+700+0 records out
+734003200 bytes (734 MB, 700 MiB) copied, 1.90526 s, 385 MB/s
+/dev/vdd contains a bcachefs filesystem
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): initializing freespace
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): done initializing freespace
+Filesystem                  Size  Used Avail Use% Mounted on
+/dev/vdb:/dev/vdc:/dev/vdd  3.7G  1.4G  2.3G  39% /mnt
+Doing online resize of /dev/vdb
+resizing /dev/vdb to 512 buckets
+ioctl error: Shrink failed: still has data
+error=EBUSY
+Error: resizing device
+
+Caused by:
+    Device or resource busy
+Error 1 at /host//etc/nixos/home/data/Code/bcachefs/ktest/tests/fs/bcachefs/shrink.ktest 88 from: bcachefs device resize ${ktest_scratch_dev[0]} 256M, exiting
+Error 1 at /host/etc/nixos/home/data/Code/bcachefs/ktest/tests/prelude.sh 347 from: ( set -e; run_test $i ), exiting
+
+========= FAILED online_three_device_replicas_shrink in 5s
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): shutting down
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): going read-only
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): finished waiting for writes to stop
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): flushing journal and stopping allocators, journal seq 45
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): flushing journal and stopping allocators complete, journal seq 46
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): clean shutdown complete, journal seq 47
+bcachefs (a244af4c-c1e0-433c-b979-10500d658aa5): shutdown complete
+========= TEST   online_two_device_data_shrink
+WATCHDOG 60
+bcachefs (vdb): Using encoding defined by superblock: utf8-12.1.0
+bcachefs (vdb): kernel does not have CONFIG_RUST enabled; this will be required for bcachefs in the near future - please alert your distribution or kernel developers if your kernel does not support CONFIG_RUST
+starting version no_sb_user_data_replicas (1.36)
+  features: new_siphash,new_extent_overwrite,btree_ptr_v2,extents_above_btree_updates,btree_updates_journalled,new_varint,journal_no_flush,alloc_v2,extents_across_btree_nodes,incompat_version_field
+bcachefs (vdb): initializing new filesystem
+bcachefs (vdb): marking superblocks
+bcachefs (vdb): going read-write
+bcachefs (vdb): initializing freespace
+bcachefs (vdb): done initializing freespace
+700+0 records in
+700+0 records out
+734003200 bytes (734 MB, 700 MiB) copied, 1.61105 s, 456 MB/s
+/dev/vdc contains a bcachefs filesystem
+bcachefs (vdb): initializing freespace
+bcachefs (vdb): done initializing freespace
+Filesystem         Size  Used Avail Use% Mounted on
+/dev/vdb:/dev/vdc  4.6G  704M  3.9G  16% /mnt
+Doing online resize of /dev/vdb
+resizing /dev/vdb to 512 buckets
+Filesystem         Size  Used Avail Use% Mounted on
+/dev/vdb:/dev/vdc  3.9G  705M  3.2G  19% /mnt
+bcachefs (vdb): shutting down
+bcachefs (vdb): going read-only
+bcachefs (vdb): finished waiting for writes to stop
+bcachefs (vdb): flushing journal and stopping allocators, journal seq 39
+bcachefs (vdb): flushing journal and stopping allocators complete, journal seq 39
+bcachefs (vdb): clean shutdown complete, journal seq 40
+bcachefs (vdb): shutdown complete
+Running in-kernel offline fsck
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): Using encoding defined by superblock: utf8-12.1.0
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): kernel does not have CONFIG_RUST enabled; this will be required for bcachefs in the near future - please alert your distribution or kernel developers if your kernel does not support CONFIG_RUST
+starting version no_sb_user_data_replicas (1.36)
+  with options: degraded=yes,fsck,fix_errors=no,noratelimit_errors,nochanges,read_only
+  features: new_siphash,new_extent_overwrite,btree_ptr_v2,extents_above_btree_updates,btree_updates_journalled,new_varint,journal_no_flush,alloc_v2,extents_across_btree_nodes,incompat_version_field
+  with devices: vdb,vdc
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): recovering from clean shutdown, journal seq 40
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): accounting_read... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): alloc_read... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): snapshots_read... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_allocations... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): going read-write
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): journal_replay... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_alloc_info...bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:2:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1, fixing
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:3:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1, fixing
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:4:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1, fixing
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): bucket_gens key for invalid buckets:
+  u64s 37 type bucket_gens 0:5:0 len 0 ver 0  : 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0, fixing
+ done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_lrus... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_btree_backpointers... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_extents_to_backpointers...bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): scanning for missing backpointers in 0/4608 buckets, 491 buckets with no backpointers
+ done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_alloc_to_lru_refs... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_snapshot_trees... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_snapshots... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_subvols... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_subvol_children... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): delete_dead_snapshots... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_inodes... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_extents... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_indirect_extents... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_dirents... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_xattrs... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_root... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_unreachable_inodes... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_subvolume_structure... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_directory_structure... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_nlinks... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_reconcile_work... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): resume_logged_ops... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): delete_dead_inodes... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): Fixed errors, running fsck a second time to verify fs is clean
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_alloc_info... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_lrus... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_btree_backpointers... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_extents_to_backpointers...bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): scanning for missing backpointers in 0/4608 buckets, 0 buckets with no backpointers
+ done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_alloc_to_lru_refs... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_snapshot_trees... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_snapshots... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_subvols... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_subvol_children... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): delete_dead_snapshots... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_inodes... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_extents... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_indirect_extents... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_dirents... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_xattrs... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_root... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_unreachable_inodes... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_subvolume_structure... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_directory_structure... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_nlinks... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): check_reconcile_work... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): resume_logged_ops... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): delete_dead_inodes... done (0 seconds)
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): Second fsck run was not clean
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): going read-only
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): finished waiting for writes to stop
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): flushing journal and stopping allocators, journal seq 45
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): flushing journal and stopping allocators complete, journal seq 45
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): clean shutdown complete, journal seq 46
+d3dccdcc-f01a-49bc-b030-6358597baa3c: errors fixed
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): shutting down
+bcachefs (d3dccdcc-f01a-49bc-b030-6358597baa3c): shutdown complete
+Error 1 at /host//etc/nixos/home/data/Code/bcachefs/ktest/tests/fs/bcachefs/shrink.ktest 63 from: bcachefs fsck -ny "${ktest_scratch_dev[0]}" "${ktest_scratch_dev[1]}", exiting
+Error 1 at /host/etc/nixos/home/data/Code/bcachefs/ktest/tests/prelude.sh 347 from: ( set -e; run_test $i ), exiting
+
+========= FAILED online_two_device_data_shrink in 6s
+Error 1 at /host/etc/nixos/home/data/Code/bcachefs/ktest/tests/prelude.sh 369 from: sort -r 2> /dev/null, exiting
+
+Passed: online_empty_shrink
+Failed: online_three_device_ec_shrink online_three_device_replicas_shrink online_two_device_data_shrink
+Error 3 at /host/etc/nixos/home/data/Code/bcachefs/ktest/tests/prelude.sh 446 from: return ${#tests_failed[@]}, exiting
+Error 3 at /host//etc/nixos/home/data/Code/bcachefs/ktest/tests/fs/bcachefs/shrink.ktest 130 from: return ${#tests_failed[@]}, exiting
+NOTICE: Automounting of tracing to debugfs is deprecated and will be removed in 2030
+Kernel version: 6.17.0-g369a18490dcb
+TEST FAILED
+qemu-system-x86_64: terminating on signal 2
