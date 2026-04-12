@@ -202,12 +202,12 @@ while true; do
     iterations=$((iterations + 1))
 
     if [[ $ret = 0 ]]; then
-	successful_iterations=$((successful_iterations + 1))
-	echo "SUCCESSFUL ITERATIONS $successful_iterations"
+    	successful_iterations=$((successful_iterations + 1))
     else
-	failed_iterations=$((failed_iterations + 1))
-	echo "FAILED ITERATIONS $failed_iterations"
+    	failed_iterations=$((failed_iterations + 1))
     fi
+    echo "SUCCESSFUL ITERATIONS $successful_iterations"
+    echo "FAILED ITERATIONS $failed_iterations"
 
     echo "TOTAL ITERATIONS $iterations"
 

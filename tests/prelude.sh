@@ -6,6 +6,7 @@
 if [[ ! -v ktest_interactive ]]; then
     ktest_failfast=false
     ktest_interactive=false
+    ktest_loop_on_failure=false
     ktest_verbose=false
     ktest_priority=0
 fi
@@ -330,6 +331,19 @@ run_test()
     fi
 }
 
+cleanup_failed_test()
+{
+    # Clear any mounts and processes a failed test left behind so the next
+    # test iteration can reinitialize its scratch devices.
+    awk '{print $2}' /proc/mounts | grep ^/mnt | sort -r 2>/dev/null | while read -r mnt; do
+	while [[ -n $(fuser -k -M -m "$mnt" 2>/dev/null) ]]; do
+	    sleep 1
+	done
+
+	umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+    done
+}
+
 run_tests()
 {
     local tests_passed=()
@@ -359,19 +373,11 @@ run_tests()
 	    echo "========= FAILED $i in $(($finish - $start))s" | to_kmsg
 	    tests_failed+=($i)
 
-	    # Try to clean up after a failed test so we can run the rest of
-	    # the tests - unless failfast is enabled, or there was only one
-	    # test to run:
+	    cleanup_failed_test
 
+	    # Stop after cleanup if requested; otherwise keep going.
 	    $ktest_failfast  && break
-	    [[ $# = 1 ]] && break
-
-	    awk '{print $2}' /proc/mounts | grep ^/mnt | sort -r 2>/dev/null | while read -r mnt; do
-		while [[ -n $(fuser -k -M -m $mnt) ]]; do
-		    sleep 1
-		done
-		umount $mnt
-	    done
+	    [[ $# = 1 && $ktest_loop_on_failure != true ]] && break
 	fi
     done
 
