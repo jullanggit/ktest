@@ -24,6 +24,7 @@ ktest_interactive=false	# if set to true, timeout is ignored completely
 ktest_exit_on_success=0	# if true, exit on success, not failure or timeout
 ktest_failfast=false
 ktest_loop=false
+ktest_loop_on_failure=false
 ktest_verbose=false	# if false, append quiet to kernel commad line
 ktest_crashdump=false
 ktest_kgdb=false
@@ -47,7 +48,7 @@ checkdep brotli
 
 # args:
 
-ktest_args="a:o:p:ISFLvxn:N:"
+ktest_args="a:o:p:ISFLRvxn:N:"
 parse_ktest_arg()
 {
     local arg=$1
@@ -73,6 +74,10 @@ parse_ktest_arg()
 	    ;;
 	L)
 	    ktest_loop=true
+	    ;;
+	R)
+	    ktest_loop=true
+	    ktest_loop_on_failure=true
 	    ;;
 	v)
 	    ktest_verbose=true
@@ -123,6 +128,7 @@ ktest_usage_run_opts()
     echo "      -S              exit on test success"
     echo "      -F              failfast - stop after first test failure"
     echo "      -L              run all tests in infinite loop until failure"
+    echo "      -R              run all tests in infinite loop, including after failures"
     echo "      -v              verbose mode"
     echo "      -N <val>        Nice value for kernel build and VM"
 }

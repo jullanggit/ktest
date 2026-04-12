@@ -182,6 +182,7 @@ cd /root
 
 export ktest_failfast
 export ktest_interactive
+export ktest_loop_on_failure
 export ktest_verbose
 export ktest_priority
 export ktest_out
@@ -191,15 +192,30 @@ set +e
 
 ret=0
 iterations=0
-while [[ $ret = 0 ]]; do
+successful_iterations=0
+failed_iterations=0
+while true; do
     /host/$ktest_test run-tests $ktest_tests
     ret=$?
     pkill -P $$ >/dev/null || true
-    [[ $ret != 0 ]]	&& break
-    $ktest_loop		|| break
 
     iterations=$((iterations + 1))
-    echo "SUCCESSFUL ITERATIONS $iterations"
+
+    if [[ $ret = 0 ]]; then
+	successful_iterations=$((successful_iterations + 1))
+	echo "SUCCESSFUL ITERATIONS $successful_iterations"
+    else
+	failed_iterations=$((failed_iterations + 1))
+	echo "FAILED ITERATIONS $failed_iterations"
+    fi
+
+    echo "TOTAL ITERATIONS $iterations"
+
+    if [[ $ret != 0 ]] && ! $ktest_loop_on_failure; then
+	break
+    fi
+
+    $ktest_loop || break
 done
 
 copy_to_host
