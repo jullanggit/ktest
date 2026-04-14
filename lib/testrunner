@@ -8,6 +8,36 @@ set -o errtrace
 
 export PS4='+`basename ${BASH_SOURCE[0]}`:${LINENO}:${FUNCNAME[0]:+${FUNCNAME[0]}()}+ '
 KERNEL_ARCH=""
+ktest_shutting_down=0
+
+shutdown_guest()
+{
+    local action=$1
+
+    ktest_shutting_down=1
+    sync || true
+
+    # The wrapper launches us in the background and immediately disowns the
+    # process, so the guest must request shutdown itself. Use sysrq so the VM
+    # exits even if userspace shutdown is wedged after the test run.
+    echo "$action" > /proc/sysrq-trigger
+}
+
+poweroff_on_exit()
+{
+    local ret=$?
+
+    trap - EXIT
+    pkill -P $$ >/dev/null || true
+
+    if [[ $ktest_shutting_down -eq 0 ]]; then
+        shutdown_guest o
+    fi
+
+    exit "$ret"
+}
+
+trap poweroff_on_exit EXIT
 
 export PATH=$PATH:/root/.cargo/bin
 
@@ -102,8 +132,7 @@ echo none | tee /sys/block/[vs]d*/queue/scheduler >/dev/null 2>&1 || true
 if [[ -s /proc/vmcore ]]; then
     echo "Collecting crash dump..."
     cp --sparse=always /proc/vmcore "$ktest_out/vmcore" || true
-    sync
-    poweroff
+    shutdown_guest o
 fi
 
 # If debugging crash dumps, add "console=hvc0" to the append line
@@ -196,7 +225,7 @@ do_reboot()
     check_taint
 
     echo $((NR_REBOOTS + 1)) | dd of=/EXPECTED_REBOOT oflag=direct 2> /dev/null
-    echo b > /proc/sysrq-trigger
+    shutdown_guest b
 }
 
 echo -n "Kernel version: "
@@ -216,7 +245,6 @@ if [[ $ktest_tests = "none" ]]; then
     exit 0
 fi
 
-trap 'pkill -P $$ >/dev/null' EXIT
 cd /root
 
 # ktest_tmp here is testrunner's /host/-rewritten *host* tmpdir; the
