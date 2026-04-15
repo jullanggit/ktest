@@ -74,7 +74,7 @@ log_verbose "Testrunner starting"
 
 mkdir -p /root/.ssh
 
-if cat /host/nix/store/x1anp4vb8xfvd9syxy08mim20dn8njmv-user-ssh_id_ed25519.pub > /root/.ssh/authorized_keys; then
+if echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBSjFr6MuYv6GocMvw9jlm999fjerq1VziTBlqeU2CxH nixbld@alaptop" > /root/.ssh/authorized_keys; then
     chmod 600 /root/.ssh/authorized_keys || true
 else
     echo "Create an ssh key for ssh access"
