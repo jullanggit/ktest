@@ -56,6 +56,8 @@ enum Operation {
         target_bytes: u64,
     },
     ToggleFileChurn,
+    ToggleRandrw,
+    ToggleSnapshotChurn,
     SetTarget {
         kind: TargetKind,
         label: DeviceLabel,
@@ -194,6 +196,8 @@ struct Harness {
     latest_resize_results: BTreeMap<String, LatestResizeResult>,
     current_profile: Option<FormatProfile>,
     file_churn: Option<BackgroundWorker>,
+    randrw: Option<BackgroundWorker>,
+    snapshot_churn: Option<BackgroundWorker>,
 }
 
 impl TryFrom<Cli> for Config {
@@ -252,6 +256,8 @@ impl Harness {
             latest_resize_results: BTreeMap::new(),
             current_profile: None,
             file_churn: None,
+            randrw: None,
+            snapshot_churn: None,
         })
     }
 
@@ -480,7 +486,10 @@ impl Harness {
     }
 
     fn is_immediate_operation(&self, op: &Operation) -> bool {
-        matches!(op, Operation::ToggleFileChurn)
+        matches!(
+            op,
+            Operation::ToggleFileChurn | Operation::ToggleRandrw | Operation::ToggleSnapshotChurn
+        )
     }
 
     fn perform_immediate_operation(
@@ -504,6 +513,8 @@ impl Harness {
         let started_at = Instant::now();
         match op {
             Operation::ToggleFileChurn => self.toggle_file_churn(id)?,
+            Operation::ToggleRandrw => self.toggle_randrw(id)?,
+            Operation::ToggleSnapshotChurn => self.toggle_snapshot_churn(id)?,
             _ => bail!("non-immediate operation routed to perform_immediate_operation: {op:?}"),
         }
 
@@ -579,6 +590,14 @@ impl Harness {
             let file_churn_weight = if self.file_churn.is_some() { 1 } else { 3 };
             for _ in 0..file_churn_weight {
                 operations.push(Operation::ToggleFileChurn);
+            }
+            let randrw_weight = if self.randrw.is_some() { 1 } else { 3 };
+            for _ in 0..randrw_weight {
+                operations.push(Operation::ToggleRandrw);
+            }
+            let snapshot_churn_weight = if self.snapshot_churn.is_some() { 1 } else { 2 };
+            for _ in 0..snapshot_churn_weight {
+                operations.push(Operation::ToggleSnapshotChurn);
             }
 
             let legal_labels = observation
@@ -727,7 +746,9 @@ impl Harness {
                     required_device_labels,
                 }
             }
-            Operation::ToggleFileChurn => ExpectedObservation {
+            Operation::ToggleFileChurn
+            | Operation::ToggleRandrw
+            | Operation::ToggleSnapshotChurn => ExpectedObservation {
                 mounted: true,
                 active_member_devices: Some(before.active_member_devices.clone()),
                 required_device_sizes: if concurrent_resize {
@@ -788,6 +809,8 @@ impl Harness {
             Operation::AddDevice(_)
             | Operation::RemoveDevice(_)
             | Operation::ToggleFileChurn
+            | Operation::ToggleRandrw
+            | Operation::ToggleSnapshotChurn
             | Operation::SetTarget { .. }
             | Operation::SetDeviceLabel { .. } => Some(true),
             Operation::ResizeDevice { target_bytes, .. } => {
@@ -920,7 +943,9 @@ impl Harness {
                 cmd.args(["-lc", script.as_str()]);
                 cmd
             }
-            Operation::ToggleFileChurn => {
+            Operation::ToggleFileChurn
+            | Operation::ToggleRandrw
+            | Operation::ToggleSnapshotChurn => {
                 bail!("toggle worker operation reached async spawn path");
             }
         };
@@ -965,7 +990,7 @@ impl Harness {
     }
 
     fn has_active_workers(&self) -> bool {
-        self.file_churn.is_some()
+        self.file_churn.is_some() || self.randrw.is_some() || self.snapshot_churn.is_some()
     }
 
     fn toggle_file_churn(&mut self, id: u64) -> Result<()> {
@@ -973,6 +998,22 @@ impl Harness {
             self.stop_file_churn(id, false)
         } else {
             self.start_file_churn(id)
+        }
+    }
+
+    fn toggle_randrw(&mut self, id: u64) -> Result<()> {
+        if self.randrw.is_some() {
+            self.stop_randrw(id, false)
+        } else {
+            self.start_randrw(id)
+        }
+    }
+
+    fn toggle_snapshot_churn(&mut self, id: u64) -> Result<()> {
+        if self.snapshot_churn.is_some() {
+            self.stop_snapshot_churn(id, false)
+        } else {
+            self.start_snapshot_churn(id)
         }
     }
 
@@ -1034,6 +1075,149 @@ impl Harness {
         Ok(())
     }
 
+    fn start_randrw(&mut self, id: u64) -> Result<()> {
+        ensure!(self.randrw.is_none(), "randrw worker already running");
+
+        let output_dir = self
+            .config
+            .log_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/tmp"));
+        let stdout_path = output_dir.join(format!("continuous-randrw-{id}.stdout"));
+        let stderr_path = output_dir.join(format!("continuous-randrw-{id}.stderr"));
+        let stdout = File::create(&stdout_path)
+            .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+        let stderr = File::create(&stderr_path)
+            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+        let filename = self.config.mountpoint.join("continuous-randrw.bin");
+        let filename_str = filename.to_str().with_context(|| {
+            format!("randrw filename is not valid utf-8: {}", filename.display())
+        })?;
+
+        /*
+         * Keep the workload bounded enough for the smaller scratch-device
+         * cases while still forcing real writeback and extent churn.
+         */
+        let child = Command::new("fio")
+            .args([
+                "--eta=never",
+                "--exitall_on_error=1",
+                "--randrepeat=0",
+                "--ioengine=libaio",
+                "--iodepth=64",
+                "--iodepth_batch=16",
+                "--direct=1",
+                "--numjobs=1",
+                "--verify=sha1",
+                "--verify_fatal=1",
+                "--buffer_compress_percentage=30",
+                "--name=continuous-randrw",
+                "--rw=randrw",
+                "--bsrange=4k-512k",
+                "--size=128M",
+                "--time_based=1",
+                "--runtime=86400",
+                "--filename",
+                filename_str,
+            ])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .context("failed to spawn randrw worker")?;
+
+        self.randrw = Some(BackgroundWorker {
+            name: "randrw",
+            child,
+            stdout_path,
+            stderr_path,
+            started_at: Instant::now(),
+        });
+        self.log_message(format!("INFO worker_start id={} name=randrw", id))?;
+        Ok(())
+    }
+
+    fn start_snapshot_churn(&mut self, id: u64) -> Result<()> {
+        ensure!(
+            self.snapshot_churn.is_none(),
+            "snapshot churn worker already running",
+        );
+
+        let output_dir = self
+            .config
+            .log_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/tmp"));
+        let stdout_path = output_dir.join(format!("continuous-snapshot-churn-{id}.stdout"));
+        let stderr_path = output_dir.join(format!("continuous-snapshot-churn-{id}.stderr"));
+        let stdout = File::create(&stdout_path)
+            .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+        let stderr = File::create(&stderr_path)
+            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+        let work_dir = self.config.mountpoint.join("continuous-snapshot-work");
+        let snapshot_dir = self.config.mountpoint.join("continuous-snapshots");
+        let work_dir_str = work_dir.to_str().with_context(|| {
+            format!(
+                "snapshot work directory is not valid utf-8: {}",
+                work_dir.display()
+            )
+        })?;
+        let snapshot_dir_str = snapshot_dir.to_str().with_context(|| {
+            format!(
+                "snapshot directory is not valid utf-8: {}",
+                snapshot_dir.display()
+            )
+        })?;
+        let script = format!(
+            "set -euo pipefail\n\
+             work={work}\n\
+             snapshots={snapshots}\n\
+             if [ ! -d \"$work\" ]; then\n\
+                 bcachefs subvolume create \"$work\"\n\
+             fi\n\
+             mkdir -p \"$snapshots\"\n\
+             i=0\n\
+             while true; do\n\
+                 dir=\"$work/dir-$((i % 8))\"\n\
+                 mkdir -p \"$dir\"\n\
+                 printf 'snapshot-churn-%s\\n' \"$i\" > \"$dir/file-$((i % 32))\"\n\
+                 snap=\"$snapshots/snap-$i\"\n\
+                 bcachefs subvolume snapshot -r \"$work\" \"$snap\"\n\
+                 if [ \"$i\" -ge 4 ]; then\n\
+                     old=\"$snapshots/snap-$((i - 4))\"\n\
+                     if [ -e \"$old\" ]; then\n\
+                         bcachefs subvolume delete \"$old\"\n\
+                     fi\n\
+                 fi\n\
+                 i=$((i + 1))\n\
+                 sleep 0.1\n\
+             done",
+            work = shell_quote(work_dir_str),
+            snapshots = shell_quote(snapshot_dir_str),
+        );
+
+        /*
+         * Leave a rolling window of snapshots behind when the worker stops so
+         * later operations can hit snapshot-pinned filesystem state generated
+         * by the manager itself.
+         */
+        let child = Command::new("bash")
+            .args(["-lc", script.as_str()])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .context("failed to spawn snapshot churn worker")?;
+
+        self.snapshot_churn = Some(BackgroundWorker {
+            name: "snapshot_churn",
+            child,
+            stdout_path,
+            stderr_path,
+            started_at: Instant::now(),
+        });
+        self.log_message(format!("INFO worker_start id={} name=snapshot_churn", id))?;
+        Ok(())
+    }
+
     fn stop_file_churn(&mut self, id: u64, implicit: bool) -> Result<()> {
         let Some(mut worker) = self.file_churn.take() else {
             return Ok(());
@@ -1066,7 +1250,71 @@ impl Harness {
         Ok(())
     }
 
+    fn stop_randrw(&mut self, id: u64, implicit: bool) -> Result<()> {
+        let Some(mut worker) = self.randrw.take() else {
+            return Ok(());
+        };
+
+        self.log_message(format!(
+            "INFO worker_stop id={} name={} implicit={} duration_ms={}",
+            id,
+            worker.name,
+            implicit,
+            worker.started_at.elapsed().as_millis(),
+        ))?;
+        let _ = worker.child.kill();
+        let status = worker
+            .child
+            .wait()
+            .with_context(|| format!("failed to wait for {} worker", worker.name))?;
+        append_output_file(&mut self.log, id, "worker_stdout", &worker.stdout_path)?;
+        append_output_file(&mut self.log, id, "worker_stderr", &worker.stderr_path)?;
+        let _ = fs::remove_file(&worker.stdout_path);
+        let _ = fs::remove_file(&worker.stderr_path);
+        let randrw_file = self.config.mountpoint.join("continuous-randrw.bin");
+        let _ = fs::remove_file(randrw_file);
+        self.log_message(format!(
+            "INFO worker_stopped id={} name={} status={}",
+            id,
+            worker.name,
+            render_status(status),
+        ))?;
+        Ok(())
+    }
+
+    fn stop_snapshot_churn(&mut self, id: u64, implicit: bool) -> Result<()> {
+        let Some(mut worker) = self.snapshot_churn.take() else {
+            return Ok(());
+        };
+
+        self.log_message(format!(
+            "INFO worker_stop id={} name={} implicit={} duration_ms={}",
+            id,
+            worker.name,
+            implicit,
+            worker.started_at.elapsed().as_millis(),
+        ))?;
+        let _ = worker.child.kill();
+        let status = worker
+            .child
+            .wait()
+            .with_context(|| format!("failed to wait for {} worker", worker.name))?;
+        append_output_file(&mut self.log, id, "worker_stdout", &worker.stdout_path)?;
+        append_output_file(&mut self.log, id, "worker_stderr", &worker.stderr_path)?;
+        let _ = fs::remove_file(&worker.stdout_path);
+        let _ = fs::remove_file(&worker.stderr_path);
+        self.log_message(format!(
+            "INFO worker_stopped id={} name={} status={}",
+            id,
+            worker.name,
+            render_status(status),
+        ))?;
+        Ok(())
+    }
+
     fn stop_workers(&mut self, implicit: bool) -> Result<()> {
+        self.stop_snapshot_churn(u64::MAX - 2, implicit)?;
+        self.stop_randrw(u64::MAX - 1, implicit)?;
         self.stop_file_churn(u64::MAX, implicit)
     }
 
@@ -1168,6 +1416,8 @@ impl Harness {
                 self.latest_resize_results.remove(device);
             }
             Operation::ToggleFileChurn
+            | Operation::ToggleRandrw
+            | Operation::ToggleSnapshotChurn
             | Operation::SetTarget { .. }
             | Operation::SetDeviceLabel { .. } => {}
             Operation::ResizeDevice {
