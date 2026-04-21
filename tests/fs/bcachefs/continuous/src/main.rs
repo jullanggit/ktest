@@ -2,7 +2,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use proptest::{
     prelude::{BoxedStrategy, Just},
-    prop_oneof,
+    sample::select,
     strategy::Strategy,
     test_runner::{Config as ProptestConfig, TestCaseError, TestError, TestRunner},
 };
@@ -43,8 +43,8 @@ struct Cli {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
-    Checkpoint,
-    Remount,
+    AddDevice(String),
+    RemoveDevice(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +71,10 @@ impl TryFrom<Cli> for Config {
         ensure!(
             !cli.available_devices.is_empty(),
             "at least one --device is required",
+        );
+        ensure!(
+            cli.available_devices.len() >= 2,
+            "at least two --device entries are required for add/remove testing",
         );
         ensure!(cli.operations > 0, "--operations must be at least 1");
         ensure!(cli.cases > 0, "--cases must be at least 1");
@@ -103,19 +107,38 @@ impl Model {
     }
 
     fn supports(&self, operation: &Operation) -> bool {
+        if !self.mounted {
+            return false;
+        }
+
         match operation {
-            Operation::Checkpoint | Operation::Remount => self.mounted,
+            Operation::AddDevice(device) => {
+                !self.active_member_devices.contains(device)
+                    && self.available_devices.contains(device)
+            }
+            Operation::RemoveDevice(device) => {
+                self.active_member_devices.len() > 1
+                    && self.active_member_devices.contains(device)
+                    && device != &self.available_devices[0]
+            }
         }
     }
 
     fn apply_transition(&self, operation: &Operation) -> Self {
+        let mut next = self.clone();
+
         match operation {
-            Operation::Checkpoint => self.clone(),
-            // This high-level transition models a completed unmount + fsck +
-            // mount cycle. The system remains mounted before and after it even
-            // though the concrete executor performs multiple commands.
-            Operation::Remount => self.clone(),
+            Operation::AddDevice(device) => {
+                if !next.active_member_devices.contains(device) {
+                    next.active_member_devices.push(device.clone());
+                }
+            }
+            Operation::RemoveDevice(device) => {
+                next.active_member_devices.retain(|d| d != device);
+            }
         }
+
+        next
     }
 }
 
@@ -153,16 +176,16 @@ impl Harness {
         for (index, op) in ops.iter().enumerate() {
             let start = Instant::now();
 
-            self.log_message(format!("INFO op_start index={} op={}", index, op.name()))?;
+            self.log_message(format!("INFO op_start index={} op={op:?}", index))?;
             match op {
-                Operation::Checkpoint => self.checkpoint()?,
-                Operation::Remount => self.remount()?,
+                Operation::AddDevice(device) => self.add_device(device)?,
+                Operation::RemoveDevice(device) => self.remove_device(device)?,
             }
+            self.assert_properties()?;
             self.model.assert_matches_reality()?;
             self.log_message(format!(
-                "INFO op_ok index={} op={} duration_ms={} mounted_model={}",
+                "INFO op_ok index={} op={op:?} duration_ms={} mounted_model={}",
                 index,
-                op.name(),
                 start.elapsed().as_millis(),
                 self.model.mounted,
             ))?;
@@ -176,30 +199,94 @@ impl Harness {
         Ok(())
     }
 
-    fn checkpoint(&mut self) -> Result<()> {
+    fn reset_to_initial_state(&mut self) -> Result<()> {
+        let primary_device = self.model.available_devices[0].clone();
+
+        self.log_message(format!(
+            "INFO reset_start active_member_devices={}",
+            self.model.active_member_devices.join(","),
+        ))?;
+
+        while self.model.active_member_devices.len() > 1 {
+            let device = self
+                .model
+                .active_member_devices
+                .last()
+                .cloned()
+                .context("active member set unexpectedly empty during reset")?;
+
+            if device == primary_device {
+                bail!("reset would remove the primary device {primary_device}");
+            }
+
+            self.remove_device(&device)?;
+        }
+
         ensure!(
-            self.model.mounted,
-            "checkpoint requires a mounted filesystem",
+            self.model.active_member_devices == vec![primary_device.clone()],
+            "reset did not restore the primary-only topology",
+        );
+
+        self.assert_properties()?;
+        self.model.assert_matches_reality()?;
+        self.log_message(format!(
+            "INFO reset_done active_member_devices={}",
+            self.model.active_member_devices.join(","),
+        ))?;
+        Ok(())
+    }
+
+    fn add_device(&mut self, device: &str) -> Result<()> {
+        ensure!(
+            self.model
+                .supports(&Operation::AddDevice(device.to_owned())),
+            "cannot add device {device} from the current model state",
         );
 
         let mountpoint = self.mountpoint_str()?.to_owned();
+        run_command(
+            &mut self.log,
+            "bcachefs",
+            &["device", "add", "-f", mountpoint.as_str(), device],
+        )?;
+        self.model = self
+            .model
+            .apply_transition(&Operation::AddDevice(device.to_owned()));
+        Ok(())
+    }
 
+    fn remove_device(&mut self, device: &str) -> Result<()> {
+        ensure!(
+            self.model
+                .supports(&Operation::RemoveDevice(device.to_owned())),
+            "cannot remove device {device} from the current model state",
+        );
+
+        let mountpoint = self.mountpoint_str()?.to_owned();
+        run_command(
+            &mut self.log,
+            "bcachefs",
+            &["device", "remove", device, mountpoint.as_str()],
+        )?;
+        self.model = self
+            .model
+            .apply_transition(&Operation::RemoveDevice(device.to_owned()));
+        Ok(())
+    }
+
+    fn assert_properties(&mut self) -> Result<()> {
+        ensure!(
+            self.model.mounted,
+            "property assertions require a mounted filesystem",
+        );
+
+        let mountpoint = self.mountpoint_str()?.to_owned();
         run_command(&mut self.log, "sync", &[])?;
         run_command(
             &mut self.log,
             "bcachefs",
             &["fs", "usage", "-h", "--all", mountpoint.as_str()],
         )?;
-        self.model = self.model.apply_transition(&Operation::Checkpoint);
-        Ok(())
-    }
-
-    fn remount(&mut self) -> Result<()> {
-        ensure!(self.model.mounted, "remount requires a mounted filesystem");
-
-        let mountpoint = self.mountpoint_str()?.to_owned();
-
-        run_command(&mut self.log, "sync", &[])?;
         run_command(&mut self.log, "umount", &[mountpoint.as_str()])?;
 
         let mut fsck_args: Vec<&str> = vec!["fsck", "-n"];
@@ -213,7 +300,6 @@ impl Harness {
             &["-t", "bcachefs", joined.as_str(), mountpoint.as_str()],
         )?;
 
-        self.model = self.model.apply_transition(&Operation::Remount);
         Ok(())
     }
 
@@ -245,15 +331,6 @@ impl Model {
         );
 
         Ok(())
-    }
-}
-
-impl Operation {
-    fn name(&self) -> &'static str {
-        match self {
-            Operation::Checkpoint => "checkpoint",
-            Operation::Remount => "remount",
-        }
     }
 }
 
@@ -307,7 +384,17 @@ fn run_generated_case(
         &harness.model == generated_initial_model,
         "generated initial state diverged from the observed runtime model",
     );
-    harness.run_case(case_index, transitions)
+    let case_result = harness.run_case(case_index, transitions);
+    let reset_result = harness.reset_to_initial_state();
+
+    match (case_result, reset_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(case_err), Ok(())) => Err(case_err),
+        (Ok(()), Err(reset_err)) => Err(reset_err),
+        (Err(case_err), Err(reset_err)) => {
+            Err(case_err.context(format!("case reset also failed: {reset_err:#}",)))
+        }
+    }
 }
 
 fn operation_sequence_strategy(
@@ -323,8 +410,30 @@ fn operation_sequence_strategy(
     )
 }
 
-fn operation_strategy(_state: &Model) -> BoxedStrategy<Operation> {
-    prop_oneof![Just(Operation::Checkpoint), Just(Operation::Remount)].boxed()
+fn operation_strategy(state: &Model) -> BoxedStrategy<Operation> {
+    let mut operations = Vec::new();
+
+    for device in &state.available_devices {
+        if state.supports(&Operation::AddDevice(device.clone())) {
+            operations.push(Operation::AddDevice(device.clone()));
+        }
+    }
+
+    for device in &state.active_member_devices {
+        if state.supports(&Operation::RemoveDevice(device.clone())) {
+            operations.push(Operation::RemoveDevice(device.clone()));
+        }
+    }
+
+    // The model keeps the primary device pinned and requires at least two
+    // available devices, so there should always be either an add or remove
+    // transition to explore from each generated state.
+    assert!(
+        !operations.is_empty(),
+        "state-machine reached a topology with no valid operations",
+    );
+
+    select(operations).boxed()
 }
 
 fn ensure_distinct_devices(devices: &[String]) -> Result<()> {
