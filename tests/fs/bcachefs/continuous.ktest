@@ -12,6 +12,7 @@ test_basic_loop()
 {
     local args=()
     local dev
+    local log="$ktest_out/continuous-basic.log"
 
     set_watchdog 180
 
@@ -19,11 +20,15 @@ test_basic_loop()
 	args+=(--device "$dev")
     done
 
-    continuous-bcachefs-test				\
+    if ! continuous-bcachefs-test				\
 	"${args[@]}"					\
-	--log "$ktest_out/continuous-basic.log"		\
+	--log "$log"					\
 	--mountpoint /mnt				\
-	--cases 4
+	--cases 4; then
+	echo ":: continuous harness log"
+	cat "$log"
+	return 1
+    fi
 }
 
 main "$@"
