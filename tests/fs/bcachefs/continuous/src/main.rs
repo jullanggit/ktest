@@ -9,11 +9,11 @@ use proptest::{
 use proptest_state_machine::strategy::Sequential;
 use std::{
     cell::Cell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::{Command, ExitStatus, Output},
     time::Instant,
 };
 
@@ -60,8 +60,13 @@ struct Config {
 struct Model {
     available_devices: Vec<String>,
     active_member_devices: Vec<String>,
-    mountpoint: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Observation {
     mounted: bool,
+    active_member_devices: Vec<String>,
+    device_indices: BTreeMap<String, u32>,
 }
 
 impl TryFrom<Cli> for Config {
@@ -91,32 +96,30 @@ impl TryFrom<Cli> for Config {
 }
 
 impl Model {
-    fn from_config(config: &Config) -> Result<Self> {
-        let mounted = is_mountpoint_active(&config.mountpoint)?;
+    fn initial(config: &Config) -> Self {
+        let mut active_member_devices = vec![config.available_devices[0].clone()];
+        sort_devices(&mut active_member_devices);
 
-        Ok(Self {
+        Self {
             available_devices: config.available_devices.clone(),
-            // The wrapper currently formats and mounts the first device before
-            // invoking the Rust harness. Keep the membership boundary inside the
-            // model by deriving the initially active set from the available
-            // pool here rather than from the CLI shape.
-            active_member_devices: vec![config.available_devices[0].clone()],
-            mountpoint: config.mountpoint.clone(),
-            mounted,
-        })
+            active_member_devices,
+        }
     }
 
     fn supports(&self, operation: &Operation) -> bool {
-        if !self.mounted {
-            return false;
-        }
-
         match operation {
             Operation::AddDevice(device) => {
                 !self.active_member_devices.contains(device)
                     && self.available_devices.contains(device)
             }
             Operation::RemoveDevice(device) => {
+                // A freshly prepared case starts with only the primary device.
+                // Removing that original member is not yet in the harness's
+                // clearly-should-succeed envelope: even without foreground IO,
+                // the filesystem may still have to evacuate data and metadata
+                // away from the seed device. Keep the first operation set to
+                // add/remove of non-seed members until the oracle can classify
+                // more subtle remove cases from live observations.
                 self.active_member_devices.len() > 1
                     && self.active_member_devices.contains(device)
                     && device != &self.available_devices[0]
@@ -131,6 +134,7 @@ impl Model {
             Operation::AddDevice(device) => {
                 if !next.active_member_devices.contains(device) {
                     next.active_member_devices.push(device.clone());
+                    sort_devices(&mut next.active_member_devices);
                 }
             }
             Operation::RemoveDevice(device) => {
@@ -144,6 +148,7 @@ impl Model {
 
 #[derive(Debug)]
 struct Harness {
+    config: Config,
     model: Model,
     log: File,
 }
@@ -155,9 +160,54 @@ impl Harness {
             .append(true)
             .open(&config.log_path)
             .with_context(|| format!("failed to open log file {}", config.log_path.display()))?;
-        let model = Model::from_config(config)?;
 
-        Ok(Self { model, log })
+        Ok(Self {
+            config: config.clone(),
+            model: Model::initial(config),
+            log,
+        })
+    }
+
+    fn prepare_fresh_filesystem(&mut self) -> Result<()> {
+        self.cleanup_mountpoint()?;
+        self.model = Model::initial(&self.config);
+
+        let primary_device = self.config.available_devices[0].clone();
+        let mountpoint = self.mountpoint_str()?.to_owned();
+
+        self.log_message(format!(
+            "INFO prepare_case primary_device={} mountpoint={mountpoint}",
+            primary_device,
+        ))?;
+
+        run_command(
+            &mut self.log,
+            "bcachefs",
+            &["format", "-f", primary_device.as_str()],
+        )?;
+        run_command(
+            &mut self.log,
+            "mount",
+            &[
+                "-t",
+                "bcachefs",
+                primary_device.as_str(),
+                mountpoint.as_str(),
+            ],
+        )?;
+
+        let observed = self.snapshot_state("after_prepare")?;
+        self.assert_model_matches_observation(&observed)?;
+        Ok(())
+    }
+
+    fn cleanup_mountpoint(&mut self) -> Result<()> {
+        if is_mountpoint_active(&self.config.mountpoint)? {
+            let mountpoint = self.mountpoint_str()?.to_owned();
+            run_command(&mut self.log, "umount", &[mountpoint.as_str()])?;
+        }
+
+        Ok(())
     }
 
     fn run_case(&mut self, case_index: u32, ops: &[Operation]) -> Result<()> {
@@ -165,171 +215,207 @@ impl Harness {
             "INFO case_start index={} transitions={:?}",
             case_index, ops
         ))?;
-        self.log_message(format!(
-            "INFO phase=startup mounted_model={} active_member_devices={} available_devices={}",
-            self.model.mounted,
-            self.model.active_member_devices.join(","),
-            self.model.available_devices.join(","),
-        ))?;
-        self.model.assert_matches_reality()?;
+
+        let initial = self.snapshot_state("case_start")?;
+        self.assert_model_matches_observation(&initial)?;
 
         for (index, op) in ops.iter().enumerate() {
             let start = Instant::now();
+            let before = self.snapshot_state("before_op")?;
+            let expected = self.expected_observation_after(&before, op)?;
 
-            self.log_message(format!("INFO op_start index={} op={op:?}", index))?;
-            match op {
-                Operation::AddDevice(device) => self.add_device(device)?,
-                Operation::RemoveDevice(device) => self.remove_device(device)?,
-            }
-            self.assert_properties()?;
-            self.model.assert_matches_reality()?;
             self.log_message(format!(
-                "INFO op_ok index={} op={op:?} duration_ms={} mounted_model={}",
+                "INFO op_start index={} op={op:?} before_active_member_devices={} expected_active_member_devices={}",
+                index,
+                before.active_member_devices.join(","),
+                expected.active_member_devices.join(","),
+            ))?;
+
+            self.execute_operation(op, &before)?;
+
+            let after = self.snapshot_state("after_op")?;
+            self.assert_expected_outcome(op, &expected, &after)?;
+            self.assert_properties(&after)?;
+            self.model = self.model.apply_transition(op);
+
+            self.log_message(format!(
+                "INFO op_ok index={} op={op:?} duration_ms={} active_member_devices={}",
                 index,
                 start.elapsed().as_millis(),
-                self.model.mounted,
+                after.active_member_devices.join(","),
             ))?;
         }
 
-        self.log_message(format!(
-            "INFO phase=done mounted_model={}",
-            self.model.mounted
-        ))?;
         self.log_message(format!("INFO case_done index={}", case_index))?;
         Ok(())
     }
 
-    fn reset_to_initial_state(&mut self) -> Result<()> {
-        let primary_device = self.model.available_devices[0].clone();
-
-        self.log_message(format!(
-            "INFO reset_start active_member_devices={}",
-            self.model.active_member_devices.join(","),
-        ))?;
-
-        while self.model.active_member_devices.len() > 1 {
-            let device = self
-                .model
-                .active_member_devices
-                .last()
-                .cloned()
-                .context("active member set unexpectedly empty during reset")?;
-
-            if device == primary_device {
-                bail!("reset would remove the primary device {primary_device}");
-            }
-
-            self.remove_device(&device)?;
-        }
-
+    fn expected_observation_after(
+        &self,
+        before: &Observation,
+        operation: &Operation,
+    ) -> Result<Observation> {
+        ensure!(before.mounted, "operations require a mounted filesystem");
         ensure!(
-            self.model.active_member_devices == vec![primary_device.clone()],
-            "reset did not restore the primary-only topology",
+            self.model.active_member_devices == before.active_member_devices,
+            "generator model diverged from observed active members before operation",
+        );
+        ensure!(
+            self.model.supports(operation),
+            "generator produced an operation unsupported by the current model: {operation:?}",
         );
 
-        self.assert_properties()?;
-        self.model.assert_matches_reality()?;
-        self.log_message(format!(
-            "INFO reset_done active_member_devices={}",
-            self.model.active_member_devices.join(","),
-        ))?;
-        Ok(())
+        let next_model = self.model.apply_transition(operation);
+        Ok(Observation {
+            mounted: true,
+            active_member_devices: next_model.active_member_devices,
+            device_indices: BTreeMap::new(),
+        })
+    }
+
+    fn execute_operation(&mut self, operation: &Operation, before: &Observation) -> Result<()> {
+        match operation {
+            Operation::AddDevice(device) => self.add_device(device),
+            Operation::RemoveDevice(device) => self.remove_device(before, device),
+        }
     }
 
     fn add_device(&mut self, device: &str) -> Result<()> {
-        ensure!(
-            self.model
-                .supports(&Operation::AddDevice(device.to_owned())),
-            "cannot add device {device} from the current model state",
-        );
-
         let mountpoint = self.mountpoint_str()?.to_owned();
         run_command(
             &mut self.log,
             "bcachefs",
             &["device", "add", "-f", mountpoint.as_str(), device],
-        )?;
-        self.model = self
-            .model
-            .apply_transition(&Operation::AddDevice(device.to_owned()));
-        Ok(())
+        )
     }
 
-    fn remove_device(&mut self, device: &str) -> Result<()> {
-        ensure!(
-            self.model
-                .supports(&Operation::RemoveDevice(device.to_owned())),
-            "cannot remove device {device} from the current model state",
-        );
-
+    fn remove_device(&mut self, before: &Observation, device: &str) -> Result<()> {
         let mountpoint = self.mountpoint_str()?.to_owned();
+        let dev_idx = before
+            .device_indices
+            .get(device)
+            .copied()
+            .with_context(|| format!("missing device index for removable member {device}"))?;
+        let dev_idx = dev_idx.to_string();
         run_command(
             &mut self.log,
             "bcachefs",
-            &["device", "remove", device, mountpoint.as_str()],
-        )?;
-        self.model = self
-            .model
-            .apply_transition(&Operation::RemoveDevice(device.to_owned()));
+            &["device", "remove", dev_idx.as_str(), mountpoint.as_str()],
+        )
+    }
+
+    fn assert_expected_outcome(
+        &mut self,
+        operation: &Operation,
+        expected: &Observation,
+        observed: &Observation,
+    ) -> Result<()> {
+        ensure!(
+            observed.mounted == expected.mounted
+                && observed.active_member_devices == expected.active_member_devices,
+            "unexpected observed topology after {operation:?}: expected {expected:?}, got {observed:?}",
+        );
         Ok(())
     }
 
-    fn assert_properties(&mut self) -> Result<()> {
+    fn assert_properties(&mut self, expected_live_topology: &Observation) -> Result<()> {
         ensure!(
-            self.model.mounted,
+            expected_live_topology.mounted,
             "property assertions require a mounted filesystem",
         );
 
         let mountpoint = self.mountpoint_str()?.to_owned();
         run_command(&mut self.log, "sync", &[])?;
-        run_command(
-            &mut self.log,
-            "bcachefs",
-            &["fs", "usage", "-h", "--all", mountpoint.as_str()],
-        )?;
         run_command(&mut self.log, "umount", &[mountpoint.as_str()])?;
 
         let mut fsck_args: Vec<&str> = vec!["fsck", "-n"];
-        fsck_args.extend(self.model.active_member_devices.iter().map(String::as_str));
+        fsck_args.extend(
+            expected_live_topology
+                .active_member_devices
+                .iter()
+                .map(String::as_str),
+        );
         run_command(&mut self.log, "bcachefs", &fsck_args)?;
 
-        let joined = self.model.active_member_devices.join(":");
+        let joined = expected_live_topology.active_member_devices.join(":");
         run_command(
             &mut self.log,
             "mount",
             &["-t", "bcachefs", joined.as_str(), mountpoint.as_str()],
         )?;
 
+        let remounted = self.snapshot_state("after_remount")?;
+        ensure!(
+            remounted.mounted == expected_live_topology.mounted
+                && remounted.active_member_devices == expected_live_topology.active_member_devices,
+            "topology changed across fsck/remount: expected {expected_live_topology:?}, got {remounted:?}",
+        );
+        Ok(())
+    }
+
+    fn snapshot_state(&mut self, phase: &str) -> Result<Observation> {
+        let mounted = is_mountpoint_active(&self.config.mountpoint)?;
+
+        if !mounted {
+            self.log_message(format!(
+                "INFO snapshot phase={} mounted=false active_member_devices=",
+                phase,
+            ))?;
+            return Ok(Observation {
+                mounted: false,
+                active_member_devices: Vec::new(),
+                device_indices: BTreeMap::new(),
+            });
+        }
+
+        let mountpoint = self.mountpoint_str()?.to_owned();
+        let usage = run_command_capture(
+            &mut self.log,
+            "bcachefs",
+            &["fs", "usage", "-h", "--all", mountpoint.as_str()],
+        )?;
+        let usage_stdout = String::from_utf8_lossy(&usage.stdout);
+        let (active_member_devices, device_indices) =
+            parse_active_member_devices(&usage_stdout, &self.config.available_devices)?;
+
+        self.log_message(format!(
+            "INFO snapshot phase={} mounted=true active_member_devices={}",
+            phase,
+            active_member_devices.join(","),
+        ))?;
+
+        Ok(Observation {
+            mounted: true,
+            active_member_devices,
+            device_indices,
+        })
+    }
+
+    fn assert_model_matches_observation(&mut self, observed: &Observation) -> Result<()> {
+        ensure!(
+            observed.mounted,
+            "expected the test filesystem to be mounted, but it is not",
+        );
+        ensure!(
+            self.model.active_member_devices == observed.active_member_devices,
+            "generator model diverged from observed topology: model={:?}, observed={:?}",
+            self.model.active_member_devices,
+            observed.active_member_devices,
+        );
         Ok(())
     }
 
     fn mountpoint_str(&self) -> Result<&str> {
-        self.model.mountpoint.to_str().with_context(|| {
+        self.config.mountpoint.to_str().with_context(|| {
             format!(
                 "mountpoint path is not valid utf-8: {}",
-                self.model.mountpoint.display()
+                self.config.mountpoint.display()
             )
         })
     }
 
     fn log_message(&mut self, message: String) -> Result<()> {
         writeln!(self.log, "{message}").context("failed to write harness log")?;
-        Ok(())
-    }
-}
-
-impl Model {
-    fn assert_matches_reality(&self) -> Result<()> {
-        let mounted = is_mountpoint_active(&self.mountpoint)?;
-
-        ensure!(
-            mounted == self.mounted,
-            "model says mounted={}, but mountpoint {} is mounted={}",
-            self.mounted,
-            self.mountpoint.display(),
-            mounted,
-        );
-
         Ok(())
     }
 }
@@ -342,7 +428,7 @@ fn main() -> Result<()> {
 }
 
 fn run_proptest_cases(config: &Config) -> Result<()> {
-    let initial_model = Model::from_config(config)?;
+    let initial_model = Model::initial(config);
     let strategy = operation_sequence_strategy(initial_model.clone(), 1..=config.operations);
     let mut runner = TestRunner::new(proptest_config(config.cases));
     let case_index = Cell::new(0_u32);
@@ -382,17 +468,19 @@ fn run_generated_case(
     let mut harness = Harness::new(config)?;
     ensure!(
         &harness.model == generated_initial_model,
-        "generated initial state diverged from the observed runtime model",
+        "generated initial state diverged from the configured initial model",
     );
-    let case_result = harness.run_case(case_index, transitions);
-    let reset_result = harness.reset_to_initial_state();
 
-    match (case_result, reset_result) {
+    let prepare_result = harness.prepare_fresh_filesystem();
+    let case_result = prepare_result.and_then(|()| harness.run_case(case_index, transitions));
+    let cleanup_result = harness.cleanup_mountpoint();
+
+    match (case_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(case_err), Ok(())) => Err(case_err),
-        (Ok(()), Err(reset_err)) => Err(reset_err),
-        (Err(case_err), Err(reset_err)) => {
-            Err(case_err.context(format!("case reset also failed: {reset_err:#}",)))
+        (Ok(()), Err(cleanup_err)) => Err(cleanup_err),
+        (Err(case_err), Err(cleanup_err)) => {
+            Err(case_err.context(format!("case cleanup also failed: {cleanup_err:#}")))
         }
     }
 }
@@ -425,15 +513,67 @@ fn operation_strategy(state: &Model) -> BoxedStrategy<Operation> {
         }
     }
 
-    // The model keeps the primary device pinned and requires at least two
-    // available devices, so there should always be either an add or remove
-    // transition to explore from each generated state.
     assert!(
         !operations.is_empty(),
         "state-machine reached a topology with no valid operations",
     );
 
     select(operations).boxed()
+}
+
+fn parse_active_member_devices(
+    usage_text: &str,
+    available_devices: &[String],
+) -> Result<(Vec<String>, BTreeMap<String, u32>)> {
+    let mut active_member_devices = Vec::new();
+    let mut device_indices = BTreeMap::new();
+
+    for line in usage_text.lines() {
+        if !line.contains("(device ") {
+            continue;
+        }
+
+        let dev_idx = line
+            .split_once("(device ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(dev_idx, _)| dev_idx.parse::<u32>().ok())
+            .with_context(|| {
+                format!("failed to parse device index from fs usage output: {line}")
+            })?;
+        let (_, rest) = line
+            .split_once(':')
+            .with_context(|| format!("failed to parse device line from fs usage output: {line}"))?;
+        let dev_name = rest
+            .split_whitespace()
+            .next()
+            .with_context(|| format!("failed to parse device name from fs usage output: {line}"))?;
+
+        let device = resolve_available_device(dev_name, available_devices);
+        device_indices.insert(device.clone(), dev_idx);
+        active_member_devices.push(device);
+    }
+
+    ensure!(
+        !active_member_devices.is_empty(),
+        "fs usage did not report any active member devices",
+    );
+    ensure_distinct_devices(&active_member_devices)?;
+    sort_devices(&mut active_member_devices);
+    Ok((active_member_devices, device_indices))
+}
+
+fn resolve_available_device(device_name: &str, available_devices: &[String]) -> String {
+    available_devices
+        .iter()
+        .find(|path| {
+            Path::new(path).file_name().and_then(|name| name.to_str()) == Some(device_name)
+        })
+        .cloned()
+        .unwrap_or_else(|| device_name.to_owned())
+}
+
+fn sort_devices(devices: &mut [String]) {
+    devices.sort();
 }
 
 fn ensure_distinct_devices(devices: &[String]) -> Result<()> {
@@ -514,6 +654,11 @@ fn is_mountpoint_active(path: &Path) -> Result<bool> {
 }
 
 fn run_command(log: &mut File, program: &str, args: &[&str]) -> Result<()> {
+    run_command_capture(log, program, args)?;
+    Ok(())
+}
+
+fn run_command_capture(log: &mut File, program: &str, args: &[&str]) -> Result<Output> {
     writeln!(log, "CMD program={} args={}", program, args.join(" "))
         .context("failed to write command header to log")?;
 
@@ -535,7 +680,7 @@ fn run_command(log: &mut File, program: &str, args: &[&str]) -> Result<()> {
         bail!("command failed: {} {}", program, args.join(" "));
     }
 
-    Ok(())
+    Ok(output)
 }
 
 fn write_output(log: &mut File, stream: &str, bytes: &[u8]) -> Result<()> {
