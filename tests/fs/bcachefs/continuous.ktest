@@ -5,29 +5,35 @@
 require-make continuous
 
 config-scratch-devs 2G
+config-scratch-devs 2G
+config-scratch-devs 2G
 
 test_basic_loop()
 {
-    local dev=${ktest_scratch_dev[0]}
+    local active_dev=${ktest_scratch_dev[0]}
+    local spare_a=${ktest_scratch_dev[1]}
+    local spare_b=${ktest_scratch_dev[2]}
 
     set_watchdog 60
 
-    run_quiet "" bcachefs format -f "$dev"
-    mount -t bcachefs "$dev" /mnt
+    run_quiet "" bcachefs format -f "$active_dev"
+    mount -t bcachefs "$active_dev" /mnt
 
     continuous-bcachefs-test				\
-	--device "$dev"					\
+	--member-device "$active_dev"			\
+	--pool-device "$spare_a"				\
+	--pool-device "$spare_b"				\
 	--log "$ktest_out/continuous-basic.log"		\
 	--mountpoint /mnt
 
     umount /mnt
 
-    bcachefs fsck -ny "$dev"
+    bcachefs fsck -ny "$active_dev"
 
-    mount -t bcachefs "$dev" /mnt
+    mount -t bcachefs "$active_dev" /mnt
     umount /mnt
 
-    bcachefs_test_end_checks "$dev"
+    bcachefs_test_end_checks "$active_dev"
 }
 
 main "$@"

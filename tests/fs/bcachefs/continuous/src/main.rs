@@ -15,14 +15,16 @@ enum Operation {
 
 #[derive(Debug)]
 struct Config {
-    devices: Vec<String>,
+    member_devices: Vec<String>,
+    pool_devices: Vec<String>,
     log_path: PathBuf,
     mountpoint: PathBuf,
 }
 
 #[derive(Debug)]
 struct Model {
-    devices: Vec<String>,
+    member_devices: Vec<String>,
+    pool_devices: Vec<String>,
     mountpoint: PathBuf,
     mounted: bool,
 }
@@ -32,7 +34,8 @@ impl Model {
         let mounted = is_mountpoint_active(&config.mountpoint)?;
 
         Ok(Self {
-            devices: config.devices.clone(),
+            member_devices: config.member_devices.clone(),
+            pool_devices: config.pool_devices.clone(),
             mountpoint: config.mountpoint.clone(),
             mounted,
         })
@@ -75,8 +78,10 @@ impl Runner {
 
     fn run(&mut self, ops: &[Operation]) -> Result<()> {
         self.log_message(format!(
-            "INFO phase=startup mounted_model={}",
-            self.model.mounted
+            "INFO phase=startup mounted_model={} member_devices={} pool_devices={}",
+            self.model.mounted,
+            self.model.member_devices.join(","),
+            self.model.pool_devices.join(","),
         ))?;
         self.model.assert_matches_reality()?;
 
@@ -133,10 +138,10 @@ impl Runner {
         self.model.mounted = false;
 
         let mut fsck_args: Vec<&str> = vec!["fsck", "-n"];
-        fsck_args.extend(self.model.devices.iter().map(String::as_str));
+        fsck_args.extend(self.model.member_devices.iter().map(String::as_str));
         run_command(&mut self.log, "bcachefs", &fsck_args)?;
 
-        let joined = self.model.devices.join(":");
+        let joined = self.model.member_devices.join(":");
         run_command(
             &mut self.log,
             "mount",
@@ -185,14 +190,16 @@ fn main() -> Result<()> {
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
-    let mut devices = Vec::new();
+    let mut member_devices = Vec::new();
+    let mut pool_devices = Vec::new();
     let mut log_path = None;
     let mut mountpoint = None;
 
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--device" => devices.push(next_arg(&mut args, "--device")?),
+            "--member-device" => member_devices.push(next_arg(&mut args, "--member-device")?),
+            "--pool-device" => pool_devices.push(next_arg(&mut args, "--pool-device")?),
             "--log" => log_path = Some(PathBuf::from(next_arg(&mut args, "--log")?)),
             "--mountpoint" => {
                 mountpoint = Some(PathBuf::from(next_arg(&mut args, "--mountpoint")?))
@@ -207,12 +214,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Config> {
         }
     }
 
-    if devices.is_empty() {
-        return Err(io::Error::other("at least one --device is required").into());
+    if member_devices.is_empty() {
+        return Err(io::Error::other("at least one --member-device is required").into());
     }
 
+    ensure_distinct_devices(&member_devices, &pool_devices)?;
+
     Ok(Config {
-        devices,
+        member_devices,
+        pool_devices,
         log_path: log_path.ok_or_else(|| io::Error::other("--log is required"))?,
         mountpoint: mountpoint.ok_or_else(|| io::Error::other("--mountpoint is required"))?,
     })
@@ -227,7 +237,21 @@ fn next_arg(
 }
 
 fn print_help() {
-    println!("Usage: continuous-bcachefs-test --device <dev>... --mountpoint <path> --log <path>");
+    println!(
+        "Usage: continuous-bcachefs-test --member-device <dev>... [--pool-device <dev>...] --mountpoint <path> --log <path>"
+    );
+}
+
+fn ensure_distinct_devices(member_devices: &[String], pool_devices: &[String]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+
+    for dev in member_devices.iter().chain(pool_devices.iter()) {
+        if !seen.insert(dev) {
+            return Err(io::Error::other(format!("device listed more than once: {dev}")).into());
+        }
+    }
+
+    Ok(())
 }
 
 fn is_mountpoint_active(path: &Path) -> Result<bool> {
