@@ -52,7 +52,7 @@ enum Operation {
 struct Config {
     available_devices: Vec<String>,
     device_physical_bytes: BTreeMap<String, u64>,
-    device_shrink_bytes: BTreeMap<String, u64>,
+    device_resize_targets: BTreeMap<String, Vec<u64>>,
     log_path: PathBuf,
     mountpoint: PathBuf,
     operations: usize,
@@ -71,6 +71,22 @@ struct Observation {
     mounted: bool,
     active_member_devices: Vec<String>,
     device_indices: BTreeMap<String, u32>,
+    device_sizes: BTreeMap<String, u64>,
+    used_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedObservation {
+    mounted: bool,
+    active_member_devices: Vec<String>,
+    device_sizes: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedOutcome {
+    require_success: Option<bool>,
+    on_success: ExpectedObservation,
+    on_failure: ExpectedObservation,
 }
 
 impl TryFrom<Cli> for Config {
@@ -90,19 +106,19 @@ impl TryFrom<Cli> for Config {
         ensure_distinct_devices(&cli.available_devices)?;
 
         let mut device_physical_bytes = BTreeMap::new();
-        let mut device_shrink_bytes = BTreeMap::new();
+        let mut device_resize_targets = BTreeMap::new();
 
         for device in &cli.available_devices {
             let physical_bytes = query_device_size_bytes(device)?;
-            let shrink_bytes = conservative_shrink_target_bytes(physical_bytes)?;
+            let resize_targets = resize_candidate_target_bytes(physical_bytes)?;
             device_physical_bytes.insert(device.clone(), physical_bytes);
-            device_shrink_bytes.insert(device.clone(), shrink_bytes);
+            device_resize_targets.insert(device.clone(), resize_targets);
         }
 
         Ok(Self {
             available_devices: cli.available_devices,
             device_physical_bytes,
-            device_shrink_bytes,
+            device_resize_targets,
             log_path: cli.log,
             mountpoint: cli.mountpoint,
             operations: cli.operations,
@@ -258,24 +274,27 @@ impl Harness {
             let expected = self.expected_observation_after(&before, op)?;
 
             self.log_message(format!(
-                "INFO op_start index={} op={op:?} before_active_member_devices={} before_sizes={} expected_active_member_devices={}",
+                "INFO op_start index={} op={op:?} before_active_member_devices={} before_sizes={} used_bytes={} expected={expected:?}",
                 index,
                 before.active_member_devices.join(","),
                 format_device_sizes(&self.model.active_member_devices, &self.model.current_device_bytes),
-                expected.active_member_devices.join(","),
+                before.used_bytes,
             ))?;
 
-            self.execute_operation(op, &before)?;
+            let success = self.execute_operation(op, &before)?;
             let after = self.snapshot_state("after_op")?;
-            self.assert_expected_outcome(op, &expected, &after)?;
+            self.assert_expected_outcome(op, &expected, success, &after)?;
             self.assert_properties(&after)?;
-            self.model = self
-                .model
-                .apply_transition(&self.config.device_physical_bytes, op);
+            if success {
+                self.model = self
+                    .model
+                    .apply_transition(&self.config.device_physical_bytes, op);
+            }
 
             self.log_message(format!(
-                "INFO op_ok index={} op={op:?} duration_ms={} active_member_devices={} model_sizes={}",
+                "INFO op_ok index={} op={op:?} success={} duration_ms={} active_member_devices={} model_sizes={}",
                 index,
+                success,
                 start.elapsed().as_millis(),
                 after.active_member_devices.join(","),
                 format_device_sizes(&self.model.active_member_devices, &self.model.current_device_bytes),
@@ -290,11 +309,23 @@ impl Harness {
         &self,
         before: &Observation,
         operation: &Operation,
-    ) -> Result<Observation> {
+    ) -> Result<ExpectedOutcome> {
         ensure!(before.mounted, "operations require a mounted filesystem");
         ensure!(
             self.model.active_member_devices == before.active_member_devices,
             "generator model diverged from observed active members before operation",
+        );
+        ensure!(
+            active_device_sizes(
+                &self.model.active_member_devices,
+                &self.model.current_device_bytes
+            ) == before.device_sizes,
+            "generator model diverged from observed device sizes: model={:?}, observed={:?}",
+            active_device_sizes(
+                &self.model.active_member_devices,
+                &self.model.current_device_bytes
+            ),
+            before.device_sizes,
         );
         ensure!(
             self.model.supports(operation),
@@ -304,17 +335,47 @@ impl Harness {
         let next_model = self
             .model
             .apply_transition(&self.config.device_physical_bytes, operation);
-        Ok(Observation {
+        let on_failure = ExpectedObservation {
             mounted: true,
+            active_member_devices: self.model.active_member_devices.clone(),
+            device_sizes: active_device_sizes(
+                &self.model.active_member_devices,
+                &self.model.current_device_bytes,
+            ),
+        };
+        let on_success = ExpectedObservation {
+            mounted: true,
+            device_sizes: active_device_sizes(
+                &next_model.active_member_devices,
+                &next_model.current_device_bytes,
+            ),
             active_member_devices: next_model.active_member_devices,
-            device_indices: BTreeMap::new(),
+        };
+
+        let require_success = match operation {
+            Operation::AddDevice(_) | Operation::RemoveDevice(_) => Some(true),
+            Operation::ResizeDevice { target_bytes, .. } => {
+                classify_resize_outcome(before.used_bytes, *target_bytes)
+            }
+        };
+
+        Ok(ExpectedOutcome {
+            require_success,
+            on_success,
+            on_failure,
         })
     }
 
-    fn execute_operation(&mut self, operation: &Operation, before: &Observation) -> Result<()> {
+    fn execute_operation(&mut self, operation: &Operation, before: &Observation) -> Result<bool> {
         match operation {
-            Operation::AddDevice(device) => self.add_device(device),
-            Operation::RemoveDevice(device) => self.remove_device(before, device),
+            Operation::AddDevice(device) => {
+                self.add_device(device)?;
+                Ok(true)
+            }
+            Operation::RemoveDevice(device) => {
+                self.remove_device(before, device)?;
+                Ok(true)
+            }
             Operation::ResizeDevice {
                 device,
                 target_bytes,
@@ -350,29 +411,40 @@ impl Harness {
         )
     }
 
-    fn resize_device(&mut self, device: &str, target_bytes: u64) -> Result<()> {
+    fn resize_device(&mut self, device: &str, target_bytes: u64) -> Result<bool> {
         let target = target_bytes.to_string();
-        // The initial resize operation set stays in an empty-filesystem envelope,
-        // with one conservative shrink target per device and a grow back to the
-        // full block-device size. That gives us synchronous success/failure
-        // signals without pretending we can already model live space pressure.
-        run_command(
+        let output = run_command_capture_allow_failure(
             &mut self.log,
             "bcachefs",
             &["device", "resize", device, target.as_str()],
-        )
+        )?;
+        Ok(output.status.success())
     }
 
     fn assert_expected_outcome(
         &mut self,
         operation: &Operation,
-        expected: &Observation,
+        expected: &ExpectedOutcome,
+        success: bool,
         observed: &Observation,
     ) -> Result<()> {
+        if let Some(required) = expected.require_success {
+            ensure!(
+                success == required,
+                "unexpected command status for {operation:?}: required success={required}, got success={success}",
+            );
+        }
+
+        let wanted = if success {
+            &expected.on_success
+        } else {
+            &expected.on_failure
+        };
         ensure!(
-            observed.mounted == expected.mounted
-                && observed.active_member_devices == expected.active_member_devices,
-            "unexpected observed topology after {operation:?}: expected {expected:?}, got {observed:?}",
+            observed.mounted == wanted.mounted
+                && observed.active_member_devices == wanted.active_member_devices
+                && observed.device_sizes == wanted.device_sizes,
+            "unexpected observed state after {operation:?}: expected {wanted:?}, got {observed:?}",
         );
         Ok(())
     }
@@ -424,6 +496,8 @@ impl Harness {
                 mounted: false,
                 active_member_devices: Vec::new(),
                 device_indices: BTreeMap::new(),
+                device_sizes: BTreeMap::new(),
+                used_bytes: 0,
             });
         }
 
@@ -431,22 +505,26 @@ impl Harness {
         let usage = run_command_capture(
             &mut self.log,
             "bcachefs",
-            &["fs", "usage", "-h", "--all", mountpoint.as_str()],
+            &["fs", "usage", "--all", mountpoint.as_str()],
         )?;
         let usage_stdout = String::from_utf8_lossy(&usage.stdout);
-        let (active_member_devices, device_indices) =
+        let (active_member_devices, device_indices, device_sizes, used_bytes) =
             parse_active_member_devices(&usage_stdout, &self.config.available_devices)?;
 
         self.log_message(format!(
-            "INFO snapshot phase={} mounted=true active_member_devices={}",
+            "INFO snapshot phase={} mounted=true used_bytes={} active_member_devices={} device_sizes={}",
             phase,
+            used_bytes,
             active_member_devices.join(","),
+            format_device_sizes(&active_member_devices, &device_sizes),
         ))?;
 
         Ok(Observation {
             mounted: true,
             active_member_devices,
             device_indices,
+            device_sizes,
+            used_bytes,
         })
     }
 
@@ -460,6 +538,18 @@ impl Harness {
             "generator model diverged from observed topology: model={:?}, observed={:?}",
             self.model.active_member_devices,
             observed.active_member_devices,
+        );
+        ensure!(
+            active_device_sizes(
+                &self.model.active_member_devices,
+                &self.model.current_device_bytes
+            ) == observed.device_sizes,
+            "generator model diverged from observed device sizes: model={:?}, observed={:?}",
+            active_device_sizes(
+                &self.model.active_member_devices,
+                &self.model.current_device_bytes
+            ),
+            observed.device_sizes,
         );
         Ok(())
     }
@@ -552,7 +642,7 @@ fn operation_sequence_strategy(
 ) -> Sequential<Model, Operation, BoxedStrategy<Model>, BoxedStrategy<Operation>> {
     let config_like = ConfigLike {
         device_physical_bytes: config.device_physical_bytes.clone(),
-        device_shrink_bytes: config.device_shrink_bytes.clone(),
+        device_resize_targets: config.device_resize_targets.clone(),
     };
 
     Sequential::new(
@@ -591,25 +681,17 @@ fn operation_strategy(state: &Model, config: &ConfigLike) -> BoxedStrategy<Opera
         let Some(&current_bytes) = state.current_device_bytes.get(device) else {
             continue;
         };
-        let Some(&physical_bytes) = config.device_physical_bytes.get(device) else {
-            continue;
-        };
-        let Some(&shrink_bytes) = config.device_shrink_bytes.get(device) else {
+        let Some(targets) = config.device_resize_targets.get(device) else {
             continue;
         };
 
-        if current_bytes == physical_bytes {
-            let op = Operation::ResizeDevice {
-                device: device.clone(),
-                target_bytes: shrink_bytes,
-            };
-            if state.supports(&op) {
-                operations.push(op);
+        for &target_bytes in targets {
+            if current_bytes == target_bytes {
+                continue;
             }
-        } else {
             let op = Operation::ResizeDevice {
                 device: device.clone(),
-                target_bytes: physical_bytes,
+                target_bytes,
             };
             if state.supports(&op) {
                 operations.push(op);
@@ -628,17 +710,32 @@ fn operation_strategy(state: &Model, config: &ConfigLike) -> BoxedStrategy<Opera
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigLike {
     device_physical_bytes: BTreeMap<String, u64>,
-    device_shrink_bytes: BTreeMap<String, u64>,
+    device_resize_targets: BTreeMap<String, Vec<u64>>,
 }
 
 fn parse_active_member_devices(
     usage_text: &str,
     available_devices: &[String],
-) -> Result<(Vec<String>, BTreeMap<String, u32>)> {
+) -> Result<(
+    Vec<String>,
+    BTreeMap<String, u32>,
+    BTreeMap<String, u64>,
+    u64,
+)> {
     let mut active_member_devices = Vec::new();
     let mut device_indices = BTreeMap::new();
+    let mut device_sizes = BTreeMap::new();
+    let mut used_bytes = None;
+    let mut current_device = None;
 
     for line in usage_text.lines() {
+        if let Some(rest) = line.strip_prefix("Used:") {
+            used_bytes = Some(rest.trim().parse::<u64>().with_context(|| {
+                format!("failed to parse used bytes from fs usage output: {line}")
+            })?);
+            continue;
+        }
+
         if line.contains("(device ") {
             let dev_idx = line
                 .split_once("(device ")
@@ -656,7 +753,26 @@ fn parse_active_member_devices(
 
             let device = resolve_available_device(dev_name, available_devices);
             device_indices.insert(device.clone(), dev_idx);
+            current_device = Some(device.clone());
             active_member_devices.push(device);
+            continue;
+        }
+
+        if let Some(rest) = line.trim_start().strip_prefix("capacity:") {
+            let device = current_device
+                .as_ref()
+                .with_context(|| format!("saw capacity line before device header: {line}"))?;
+            let size_bytes = rest
+                .split_whitespace()
+                .next()
+                .with_context(|| {
+                    format!("failed to parse device capacity from fs usage output: {line}")
+                })?
+                .parse::<u64>()
+                .with_context(|| {
+                    format!("failed to parse device capacity bytes from fs usage output: {line}")
+                })?;
+            device_sizes.insert(device.clone(), size_bytes);
         }
     }
 
@@ -664,9 +780,20 @@ fn parse_active_member_devices(
         !active_member_devices.is_empty(),
         "fs usage did not report any active member devices",
     );
+    let used_bytes =
+        used_bytes.with_context(|| "fs usage did not report total Used bytes".to_string())?;
     ensure_distinct_devices(&active_member_devices)?;
+    ensure!(
+        device_sizes.len() == active_member_devices.len(),
+        "fs usage did not report capacities for every active device: devices={active_member_devices:?} sizes={device_sizes:?}",
+    );
     sort_devices(&mut active_member_devices);
-    Ok((active_member_devices, device_indices))
+    Ok((
+        active_member_devices,
+        device_indices,
+        device_sizes,
+        used_bytes,
+    ))
 }
 
 fn resolve_available_device(device_name: &str, available_devices: &[String]) -> String {
@@ -695,6 +822,20 @@ fn ensure_distinct_devices(devices: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn active_device_sizes(
+    active_devices: &[String],
+    current_device_bytes: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    active_devices
+        .iter()
+        .filter_map(|device| {
+            current_device_bytes
+                .get(device)
+                .map(|bytes| (device.clone(), *bytes))
+        })
+        .collect()
+}
+
 fn query_device_size_bytes(device: &str) -> Result<u64> {
     let output = Command::new("blockdev")
         .args(["--getsize64", device])
@@ -717,19 +858,36 @@ fn query_device_size_bytes(device: &str) -> Result<u64> {
         .with_context(|| format!("failed to parse device size for {device}: {stdout:?}"))
 }
 
-fn conservative_shrink_target_bytes(physical_bytes: u64) -> Result<u64> {
-    let mib = 1_u64 << 20;
-    let shrink_bytes = (physical_bytes / 2 / mib) * mib;
+fn resize_candidate_target_bytes(physical_bytes: u64) -> Result<Vec<u64>> {
+    const MIN_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+    const STEP_BYTES: u64 = 64 * 1024 * 1024;
 
     ensure!(
-        shrink_bytes >= 512 * mib,
-        "device size {physical_bytes} is too small for the initial conservative shrink target",
+        physical_bytes >= MIN_TARGET_BYTES + STEP_BYTES,
+        "device size {physical_bytes} is too small for resize target generation",
     );
-    ensure!(
-        shrink_bytes < physical_bytes,
-        "conservative shrink target {shrink_bytes} must be smaller than physical size {physical_bytes}",
-    );
-    Ok(shrink_bytes)
+
+    let mut targets = Vec::new();
+    let mut target = MIN_TARGET_BYTES;
+    while target < physical_bytes {
+        targets.push(target);
+        target += STEP_BYTES;
+    }
+    targets.push(physical_bytes);
+
+    Ok(targets)
+}
+
+fn classify_resize_outcome(used_bytes: u64, target_bytes: u64) -> Option<bool> {
+    const AMBIGUOUS_MARGIN_BYTES: u64 = 50 * 1024 * 1024;
+
+    if target_bytes.saturating_add(AMBIGUOUS_MARGIN_BYTES) < used_bytes {
+        Some(false)
+    } else if target_bytes > used_bytes.saturating_add(AMBIGUOUS_MARGIN_BYTES) {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn format_device_sizes(
