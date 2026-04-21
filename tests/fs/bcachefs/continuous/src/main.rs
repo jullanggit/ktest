@@ -45,11 +45,14 @@ struct Cli {
 enum Operation {
     AddDevice(String),
     RemoveDevice(String),
+    ResizeDevice { device: String, target_bytes: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Config {
     available_devices: Vec<String>,
+    device_physical_bytes: BTreeMap<String, u64>,
+    device_shrink_bytes: BTreeMap<String, u64>,
     log_path: PathBuf,
     mountpoint: PathBuf,
     operations: usize,
@@ -60,6 +63,7 @@ struct Config {
 struct Model {
     available_devices: Vec<String>,
     active_member_devices: Vec<String>,
+    current_device_bytes: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,8 +89,20 @@ impl TryFrom<Cli> for Config {
         ensure!(cli.cases > 0, "--cases must be at least 1");
         ensure_distinct_devices(&cli.available_devices)?;
 
+        let mut device_physical_bytes = BTreeMap::new();
+        let mut device_shrink_bytes = BTreeMap::new();
+
+        for device in &cli.available_devices {
+            let physical_bytes = query_device_size_bytes(device)?;
+            let shrink_bytes = conservative_shrink_target_bytes(physical_bytes)?;
+            device_physical_bytes.insert(device.clone(), physical_bytes);
+            device_shrink_bytes.insert(device.clone(), shrink_bytes);
+        }
+
         Ok(Self {
             available_devices: cli.available_devices,
+            device_physical_bytes,
+            device_shrink_bytes,
             log_path: cli.log,
             mountpoint: cli.mountpoint,
             operations: cli.operations,
@@ -103,6 +119,7 @@ impl Model {
         Self {
             available_devices: config.available_devices.clone(),
             active_member_devices,
+            current_device_bytes: config.device_physical_bytes.clone(),
         }
     }
 
@@ -115,10 +132,24 @@ impl Model {
             Operation::RemoveDevice(device) => {
                 self.active_member_devices.len() > 1 && self.active_member_devices.contains(device)
             }
+            Operation::ResizeDevice {
+                device,
+                target_bytes,
+            } => {
+                self.active_member_devices.contains(device)
+                    && self
+                        .current_device_bytes
+                        .get(device)
+                        .is_some_and(|current| current != target_bytes)
+            }
         }
     }
 
-    fn apply_transition(&self, operation: &Operation) -> Self {
+    fn apply_transition(
+        &self,
+        device_physical_bytes: &BTreeMap<String, u64>,
+        operation: &Operation,
+    ) -> Self {
         let mut next = self.clone();
 
         match operation {
@@ -127,9 +158,20 @@ impl Model {
                     next.active_member_devices.push(device.clone());
                     sort_devices(&mut next.active_member_devices);
                 }
+                if let Some(physical_bytes) = device_physical_bytes.get(device) {
+                    next.current_device_bytes
+                        .insert(device.clone(), *physical_bytes);
+                }
             }
             Operation::RemoveDevice(device) => {
                 next.active_member_devices.retain(|d| d != device);
+            }
+            Operation::ResizeDevice {
+                device,
+                target_bytes,
+            } => {
+                next.current_device_bytes
+                    .insert(device.clone(), *target_bytes);
             }
         }
 
@@ -216,9 +258,10 @@ impl Harness {
             let expected = self.expected_observation_after(&before, op)?;
 
             self.log_message(format!(
-                "INFO op_start index={} op={op:?} before_active_member_devices={} expected_active_member_devices={}",
+                "INFO op_start index={} op={op:?} before_active_member_devices={} before_sizes={} expected_active_member_devices={}",
                 index,
                 before.active_member_devices.join(","),
+                format_device_sizes(&self.model.active_member_devices, &self.model.current_device_bytes),
                 expected.active_member_devices.join(","),
             ))?;
 
@@ -226,13 +269,16 @@ impl Harness {
             let after = self.snapshot_state("after_op")?;
             self.assert_expected_outcome(op, &expected, &after)?;
             self.assert_properties(&after)?;
-            self.model = self.model.apply_transition(op);
+            self.model = self
+                .model
+                .apply_transition(&self.config.device_physical_bytes, op);
 
             self.log_message(format!(
-                "INFO op_ok index={} op={op:?} duration_ms={} active_member_devices={}",
+                "INFO op_ok index={} op={op:?} duration_ms={} active_member_devices={} model_sizes={}",
                 index,
                 start.elapsed().as_millis(),
                 after.active_member_devices.join(","),
+                format_device_sizes(&self.model.active_member_devices, &self.model.current_device_bytes),
             ))?;
         }
 
@@ -255,7 +301,9 @@ impl Harness {
             "generator produced an operation unsupported by the current model: {operation:?}",
         );
 
-        let next_model = self.model.apply_transition(operation);
+        let next_model = self
+            .model
+            .apply_transition(&self.config.device_physical_bytes, operation);
         Ok(Observation {
             mounted: true,
             active_member_devices: next_model.active_member_devices,
@@ -267,6 +315,10 @@ impl Harness {
         match operation {
             Operation::AddDevice(device) => self.add_device(device),
             Operation::RemoveDevice(device) => self.remove_device(before, device),
+            Operation::ResizeDevice {
+                device,
+                target_bytes,
+            } => self.resize_device(device, *target_bytes),
         }
     }
 
@@ -295,6 +347,19 @@ impl Harness {
             &mut self.log,
             "bcachefs",
             &["device", "remove", dev_idx.as_str(), mountpoint.as_str()],
+        )
+    }
+
+    fn resize_device(&mut self, device: &str, target_bytes: u64) -> Result<()> {
+        let target = target_bytes.to_string();
+        // The initial resize operation set stays in an empty-filesystem envelope,
+        // with one conservative shrink target per device and a grow back to the
+        // full block-device size. That gives us synchronous success/failure
+        // signals without pretending we can already model live space pressure.
+        run_command(
+            &mut self.log,
+            "bcachefs",
+            &["device", "resize", device, target.as_str()],
         )
     }
 
@@ -423,7 +488,8 @@ fn main() -> Result<()> {
 
 fn run_proptest_cases(config: &Config) -> Result<()> {
     let initial_model = Model::initial(config);
-    let strategy = operation_sequence_strategy(initial_model.clone(), 1..=config.operations);
+    let strategy =
+        operation_sequence_strategy(config, initial_model.clone(), 1..=config.operations);
     let mut runner = TestRunner::new(proptest_config(config.cases));
     let case_index = Cell::new(0_u32);
 
@@ -480,19 +546,33 @@ fn run_generated_case(
 }
 
 fn operation_sequence_strategy(
+    config: &Config,
     initial_model: Model,
     size: impl Into<proptest::collection::SizeRange>,
 ) -> Sequential<Model, Operation, BoxedStrategy<Model>, BoxedStrategy<Operation>> {
+    let config_like = ConfigLike {
+        device_physical_bytes: config.device_physical_bytes.clone(),
+        device_shrink_bytes: config.device_shrink_bytes.clone(),
+    };
+
     Sequential::new(
         size.into(),
         move || Just(initial_model.clone()).boxed(),
         |state, transition| state.supports(transition),
-        operation_strategy,
-        |state, transition| state.apply_transition(transition),
+        {
+            let config = config_like.clone();
+            move |state| operation_strategy(state, &config)
+        },
+        {
+            let config = config_like;
+            move |state, transition| {
+                state.apply_transition(&config.device_physical_bytes, transition)
+            }
+        },
     )
 }
 
-fn operation_strategy(state: &Model) -> BoxedStrategy<Operation> {
+fn operation_strategy(state: &Model, config: &ConfigLike) -> BoxedStrategy<Operation> {
     let mut operations = Vec::new();
 
     for device in &state.available_devices {
@@ -507,12 +587,48 @@ fn operation_strategy(state: &Model) -> BoxedStrategy<Operation> {
         }
     }
 
+    for device in &state.active_member_devices {
+        let Some(&current_bytes) = state.current_device_bytes.get(device) else {
+            continue;
+        };
+        let Some(&physical_bytes) = config.device_physical_bytes.get(device) else {
+            continue;
+        };
+        let Some(&shrink_bytes) = config.device_shrink_bytes.get(device) else {
+            continue;
+        };
+
+        if current_bytes == physical_bytes {
+            let op = Operation::ResizeDevice {
+                device: device.clone(),
+                target_bytes: shrink_bytes,
+            };
+            if state.supports(&op) {
+                operations.push(op);
+            }
+        } else {
+            let op = Operation::ResizeDevice {
+                device: device.clone(),
+                target_bytes: physical_bytes,
+            };
+            if state.supports(&op) {
+                operations.push(op);
+            }
+        }
+    }
+
     assert!(
         !operations.is_empty(),
         "state-machine reached a topology with no valid operations",
     );
 
     select(operations).boxed()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigLike {
+    device_physical_bytes: BTreeMap<String, u64>,
+    device_shrink_bytes: BTreeMap<String, u64>,
 }
 
 fn parse_active_member_devices(
@@ -577,6 +693,58 @@ fn ensure_distinct_devices(devices: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn query_device_size_bytes(device: &str) -> Result<u64> {
+    let output = Command::new("blockdev")
+        .args(["--getsize64", device])
+        .output()
+        .with_context(|| format!("failed to query size for device {device}"))?;
+
+    if !output.status.success() {
+        bail!(
+            "blockdev --getsize64 {} failed with status {}",
+            device,
+            render_status(output.status),
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("device size output for {device} was not utf-8"))?;
+    stdout
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("failed to parse device size for {device}: {stdout:?}"))
+}
+
+fn conservative_shrink_target_bytes(physical_bytes: u64) -> Result<u64> {
+    let mib = 1_u64 << 20;
+    let shrink_bytes = (physical_bytes / 2 / mib) * mib;
+
+    ensure!(
+        shrink_bytes >= 512 * mib,
+        "device size {physical_bytes} is too small for the initial conservative shrink target",
+    );
+    ensure!(
+        shrink_bytes < physical_bytes,
+        "conservative shrink target {shrink_bytes} must be smaller than physical size {physical_bytes}",
+    );
+    Ok(shrink_bytes)
+}
+
+fn format_device_sizes(
+    active_devices: &[String],
+    current_device_bytes: &BTreeMap<String, u64>,
+) -> String {
+    active_devices
+        .iter()
+        .filter_map(|device| {
+            current_device_bytes
+                .get(device)
+                .map(|bytes| format!("{device}={bytes}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn proptest_config(cases: u32) -> ProptestConfig {
