@@ -1,6 +1,6 @@
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -51,7 +51,18 @@ struct Cli {
 enum Operation {
     AddDevice(String),
     RemoveDevice(String),
-    ResizeDevice { device: String, target_bytes: u64 },
+    ResizeDevice {
+        device: String,
+        target_bytes: u64,
+    },
+    SetTarget {
+        kind: TargetKind,
+        label: DeviceLabel,
+    },
+    SetDeviceLabel {
+        device: String,
+        label: DeviceLabel,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +79,57 @@ struct Config {
     spawn_interval_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DeviceLabel {
+    Foreground,
+    Background,
+}
+
+impl DeviceLabel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "" => None,
+            "foreground" => Some(Self::Foreground),
+            "background" => Some(Self::Background),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FormatProfile {
+    replicas: usize,
+    erasure_code: bool,
+    encrypted: bool,
+    compression: Option<&'static str>,
+    initial_devices: Vec<String>,
+    device_bucket_sizes: BTreeMap<String, &'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TargetKind {
+    Foreground,
+    Background,
+    Promote,
+}
+
+impl TargetKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground_target",
+            Self::Background => "background_target",
+            Self::Promote => "promote_target",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Observation {
     mounted: bool,
@@ -75,6 +137,8 @@ struct Observation {
     device_indices: BTreeMap<String, u32>,
     device_sizes: BTreeMap<String, u64>,
     used_bytes: u64,
+    targets: BTreeMap<TargetKind, Option<DeviceLabel>>,
+    device_labels: BTreeMap<String, Option<DeviceLabel>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +146,8 @@ struct ExpectedObservation {
     mounted: bool,
     active_member_devices: Option<Vec<String>>,
     required_device_sizes: BTreeMap<String, u64>,
+    required_targets: BTreeMap<TargetKind, Option<DeviceLabel>>,
+    required_device_labels: BTreeMap<String, Option<DeviceLabel>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +182,7 @@ struct Harness {
     config: Config,
     log: File,
     latest_resize_results: BTreeMap<String, LatestResizeResult>,
+    current_profile: Option<FormatProfile>,
 }
 
 impl TryFrom<Cli> for Config {
@@ -172,33 +239,34 @@ impl Harness {
             config: config.clone(),
             log,
             latest_resize_results: BTreeMap::new(),
+            current_profile: None,
         })
     }
 
-    fn prepare_fresh_filesystem(&mut self) -> Result<()> {
+    fn prepare_fresh_filesystem(&mut self, seed: u64) -> Result<()> {
         self.latest_resize_results.clear();
         self.cleanup_mountpoint()?;
 
-        let primary_device = self.config.available_devices[0].clone();
+        let profile = FormatProfile::random(&self.config, seed)?;
+        self.current_profile = Some(profile.clone());
         let mountpoint = self.mountpoint_str()?.to_owned();
+        let joined_devices = profile.initial_devices.join(":");
 
         self.log_message(format!(
-            "INFO prepare_case primary_device={} mountpoint={mountpoint}",
-            primary_device,
+            "INFO prepare_case mountpoint={} profile={profile:?}",
+            mountpoint,
         ))?;
 
-        run_command(
-            &mut self.log,
-            "bcachefs",
-            &["format", "-f", primary_device.as_str()],
-        )?;
+        let format_args = format_args_for_profile(&profile);
+        let format_arg_refs = format_args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_command(&mut self.log, "bcachefs", &format_arg_refs)?;
         run_command(
             &mut self.log,
             "mount",
             &[
                 "-t",
                 "bcachefs",
-                primary_device.as_str(),
+                joined_devices.as_str(),
                 mountpoint.as_str(),
             ],
         )?;
@@ -209,13 +277,16 @@ impl Harness {
             "expected the test filesystem to be mounted after prepare",
         );
         ensure!(
-            observed.active_member_devices == vec![primary_device.clone()],
+            observed.active_member_devices == profile.initial_devices,
             "unexpected initial topology after prepare: {:?}",
             observed,
         );
         ensure!(
-            observed.device_sizes.get(&primary_device)
-                == self.config.device_physical_bytes.get(&primary_device),
+            observed.device_sizes
+                == active_device_sizes(
+                    &observed.active_member_devices,
+                    &self.config.device_physical_bytes,
+                ),
             "unexpected initial device size after prepare: {:?}",
             observed,
         );
@@ -264,7 +335,7 @@ impl Harness {
 
                     if !candidates.is_empty() && (inflight.is_empty() || rng.gen_bool(0.5)) {
                         let op = candidates[rng.gen_range(0..candidates.len())].clone();
-                        let expected = self.expected_outcome(&observation, &op)?;
+                        let expected = self.expected_outcome(&observation, &inflight, &op)?;
                         self.mark_superseded(&mut inflight, &op)?;
                         let spawned = self.spawn_operation(
                             next_op_id,
@@ -398,7 +469,19 @@ impl Harness {
                 }
             }
 
-            if observation.active_member_devices.len() > 1 {
+            let min_member_count = self
+                .current_profile
+                .as_ref()
+                .map(FormatProfile::minimum_member_count)
+                .unwrap_or(1);
+
+            /*
+             * Cases start at the minimum topology for the chosen redundancy
+             * mode, so removing a member from that floor is not a clear
+             * success case. Defer remove coverage until add has grown the
+             * topology past the current format profile's minimum.
+             */
+            if observation.active_member_devices.len() > min_member_count {
                 for device in &observation.active_member_devices {
                     operations.push(Operation::RemoveDevice(device.clone()));
                 }
@@ -406,6 +489,54 @@ impl Harness {
         }
 
         if !topology_locked {
+            let legal_labels = observation
+                .device_labels
+                .values()
+                .filter_map(|label| *label)
+                .collect::<BTreeSet<_>>();
+
+            for kind in [
+                TargetKind::Foreground,
+                TargetKind::Background,
+                TargetKind::Promote,
+            ] {
+                for label in legal_labels.iter().copied() {
+                    if observation.targets.get(&kind).copied().flatten() == Some(label) {
+                        continue;
+                    }
+
+                    let mut weight = 1;
+                    if observation.targets.get(&kind).copied().flatten().is_none() {
+                        weight = 3;
+                    }
+
+                    for _ in 0..weight {
+                        operations.push(Operation::SetTarget { kind, label });
+                    }
+                }
+            }
+
+            for device in &observation.active_member_devices {
+                for label in [DeviceLabel::Foreground, DeviceLabel::Background] {
+                    let current = observation.device_labels.get(device).copied().flatten();
+                    if current == Some(label) {
+                        continue;
+                    }
+
+                    let mut weight = 1;
+                    if current.is_none() {
+                        weight = 3;
+                    }
+
+                    for _ in 0..weight {
+                        operations.push(Operation::SetDeviceLabel {
+                            device: device.clone(),
+                            label,
+                        });
+                    }
+                }
+            }
+
             for device in &observation.active_member_devices {
                 let Some(&current_bytes) = observation.device_sizes.get(device) else {
                     continue;
@@ -443,14 +574,25 @@ impl Harness {
     fn expected_outcome(
         &self,
         before: &Observation,
+        inflight: &[InflightOperation],
         operation: &Operation,
     ) -> Result<ExpectedOutcome> {
         ensure!(before.mounted, "operations require a mounted filesystem");
 
+        let concurrent_resize = inflight
+            .iter()
+            .any(|op| matches!(op.op, Operation::ResizeDevice { .. }));
+
         let on_failure = ExpectedObservation {
             mounted: true,
             active_member_devices: Some(before.active_member_devices.clone()),
-            required_device_sizes: before.device_sizes.clone(),
+            required_device_sizes: if concurrent_resize {
+                BTreeMap::new()
+            } else {
+                before.device_sizes.clone()
+            },
+            required_targets: before.targets.clone(),
+            required_device_labels: before.device_labels.clone(),
         };
 
         let on_success = match operation {
@@ -472,6 +614,8 @@ impl Harness {
                     mounted: true,
                     active_member_devices: Some(active),
                     required_device_sizes,
+                    required_targets: before.targets.clone(),
+                    required_device_labels: before.device_labels.clone(),
                 }
             }
             Operation::RemoveDevice(device) => {
@@ -480,11 +624,47 @@ impl Harness {
 
                 let mut required_device_sizes = before.device_sizes.clone();
                 required_device_sizes.remove(device);
+                let mut required_device_labels = before.device_labels.clone();
+                required_device_labels.remove(device);
 
                 ExpectedObservation {
                     mounted: true,
                     active_member_devices: Some(active),
                     required_device_sizes,
+                    required_targets: before.targets.clone(),
+                    required_device_labels,
+                }
+            }
+            Operation::SetTarget { kind, label } => {
+                let mut required_targets = BTreeMap::new();
+                required_targets.insert(*kind, Some(*label));
+
+                ExpectedObservation {
+                    mounted: true,
+                    active_member_devices: Some(before.active_member_devices.clone()),
+                    required_device_sizes: if concurrent_resize {
+                        BTreeMap::new()
+                    } else {
+                        before.device_sizes.clone()
+                    },
+                    required_targets,
+                    required_device_labels: before.device_labels.clone(),
+                }
+            }
+            Operation::SetDeviceLabel { device, label } => {
+                let mut required_device_labels = BTreeMap::new();
+                required_device_labels.insert(device.clone(), Some(*label));
+
+                ExpectedObservation {
+                    mounted: true,
+                    active_member_devices: Some(before.active_member_devices.clone()),
+                    required_device_sizes: if concurrent_resize {
+                        BTreeMap::new()
+                    } else {
+                        before.device_sizes.clone()
+                    },
+                    required_targets: before.targets.clone(),
+                    required_device_labels,
                 }
             }
             /*
@@ -496,11 +676,16 @@ impl Harness {
                 mounted: true,
                 active_member_devices: Some(before.active_member_devices.clone()),
                 required_device_sizes: BTreeMap::new(),
+                required_targets: BTreeMap::new(),
+                required_device_labels: BTreeMap::new(),
             },
         };
 
         let require_success = match operation {
-            Operation::AddDevice(_) | Operation::RemoveDevice(_) => Some(true),
+            Operation::AddDevice(_)
+            | Operation::RemoveDevice(_)
+            | Operation::SetTarget { .. }
+            | Operation::SetDeviceLabel { .. } => Some(true),
             Operation::ResizeDevice { target_bytes, .. } => {
                 classify_resize_outcome(before.used_bytes, *target_bytes)
             }
@@ -598,6 +783,37 @@ impl Harness {
                 let target = target_bytes.to_string();
                 let mut cmd = Command::new("bcachefs");
                 cmd.args(["device", "resize", device.as_str(), target.as_str()]);
+                cmd
+            }
+            Operation::SetTarget { kind, label } => {
+                let mut cmd = Command::new("bcachefs");
+                cmd.arg("set-fs-option");
+                cmd.arg(format!("--{}={}", kind.as_str(), label.as_str()));
+                for device in &before.active_member_devices {
+                    cmd.arg(device);
+                }
+                cmd
+            }
+            Operation::SetDeviceLabel { device, label } => {
+                let sysfs_root = find_single_bcachefs_sysfs_dir()?;
+                let dev_idx = before
+                    .device_indices
+                    .get(device)
+                    .copied()
+                    .with_context(|| {
+                        format!("missing device index for relabeling member {device}")
+                    })?;
+                let label_path = sysfs_root.join(format!("dev-{dev_idx}/label"));
+                let script = format!(
+                    "printf '%s\\n' {} > {}",
+                    shell_quote(label.as_str()),
+                    shell_quote(label_path.to_str().with_context(|| format!(
+                        "sysfs label path is not valid utf-8: {}",
+                        label_path.display()
+                    ))?,),
+                );
+                let mut cmd = Command::new("bash");
+                cmd.args(["-lc", script.as_str()]);
                 cmd
             }
         };
@@ -708,6 +924,28 @@ impl Harness {
             );
         }
 
+        for (kind, expected_label) in &expected.required_targets {
+            let observed_label = observed.targets.get(kind).copied().flatten();
+            ensure!(
+                observed_label == *expected_label,
+                "unexpected target {:?} after {operation:?}: expected {:?}, got {:?}",
+                kind,
+                expected_label,
+                observed_label,
+            );
+        }
+
+        for (device, expected_label) in &expected.required_device_labels {
+            let observed_label = observed.device_labels.get(device).copied().flatten();
+            ensure!(
+                observed_label == *expected_label,
+                "unexpected device label for {} after {operation:?}: expected {:?}, got {:?}",
+                device,
+                expected_label,
+                observed_label,
+            );
+        }
+
         Ok(())
     }
 
@@ -716,6 +954,7 @@ impl Harness {
             Operation::AddDevice(device) | Operation::RemoveDevice(device) => {
                 self.latest_resize_results.remove(device);
             }
+            Operation::SetTarget { .. } | Operation::SetDeviceLabel { .. } => {}
             Operation::ResizeDevice {
                 device,
                 target_bytes,
@@ -827,6 +1066,8 @@ impl Harness {
                 device_indices: BTreeMap::new(),
                 device_sizes: BTreeMap::new(),
                 used_bytes: 0,
+                targets: BTreeMap::new(),
+                device_labels: BTreeMap::new(),
             });
         }
 
@@ -839,6 +1080,10 @@ impl Harness {
         let usage_stdout = String::from_utf8_lossy(&usage.stdout);
         let (active_member_devices, device_indices, device_sizes, used_bytes) =
             parse_active_member_devices(&usage_stdout, &self.config.available_devices)?;
+        let sysfs_root = find_single_bcachefs_sysfs_dir()?;
+        let targets = read_fs_targets(&sysfs_root)?;
+        let device_labels =
+            read_device_labels(&sysfs_root, &active_member_devices, &device_indices)?;
 
         self.log_message(format!(
             "INFO snapshot phase={} mounted=true used_bytes={} active_member_devices={} device_sizes={}",
@@ -854,6 +1099,8 @@ impl Harness {
             device_indices,
             device_sizes,
             used_bytes,
+            targets,
+            device_labels,
         })
     }
 
@@ -884,7 +1131,7 @@ fn run_cases(config: &Config) -> Result<()> {
         let mut harness = Harness::new(config)?;
         let seed = config.seed.wrapping_add(case_index as u64);
 
-        let prepare_result = harness.prepare_fresh_filesystem();
+        let prepare_result = harness.prepare_fresh_filesystem(seed);
         let case_result = prepare_result.and_then(|()| harness.run_case(case_index, seed));
         let cleanup_result = harness.cleanup_mountpoint();
 
@@ -990,6 +1237,155 @@ fn parse_active_member_devices(
     ))
 }
 
+fn find_single_bcachefs_sysfs_dir() -> Result<PathBuf> {
+    let entries = fs::read_dir("/sys/fs/bcachefs")
+        .context("failed to read /sys/fs/bcachefs")?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+
+    ensure!(
+        entries.len() == 1,
+        "expected exactly one mounted bcachefs sysfs directory, found {:?}",
+        entries,
+    );
+
+    Ok(entries[0].clone())
+}
+
+fn read_fs_targets(sysfs_root: &Path) -> Result<BTreeMap<TargetKind, Option<DeviceLabel>>> {
+    let options_dir = sysfs_root.join("options");
+    let mut targets = BTreeMap::new();
+
+    for kind in [
+        TargetKind::Foreground,
+        TargetKind::Background,
+        TargetKind::Promote,
+    ] {
+        let path = options_dir.join(kind.as_str());
+        let value = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read target {}", path.display()))?;
+        targets.insert(kind, DeviceLabel::parse(&value));
+    }
+
+    Ok(targets)
+}
+
+fn read_device_labels(
+    sysfs_root: &Path,
+    active_member_devices: &[String],
+    device_indices: &BTreeMap<String, u32>,
+) -> Result<BTreeMap<String, Option<DeviceLabel>>> {
+    let mut labels = BTreeMap::new();
+
+    for device in active_member_devices {
+        let dev_idx = device_indices
+            .get(device)
+            .copied()
+            .with_context(|| format!("missing device index for {}", device))?;
+        let path = sysfs_root.join(format!("dev-{dev_idx}/label"));
+        let value = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read device label {}", path.display()))?;
+        labels.insert(device.clone(), DeviceLabel::parse(&value));
+    }
+
+    Ok(labels)
+}
+
+impl FormatProfile {
+    fn random(config: &Config, seed: u64) -> Result<Self> {
+        const BUCKET_SIZES: &[&str] = &["32k", "64k", "128k"];
+        const FORMAT_SEED_XOR: u64 = 0xa1b2_c3d4_e5f6_1024;
+
+        let mut rng = StdRng::seed_from_u64(seed ^ FORMAT_SEED_XOR);
+        let max_replicas = config.available_devices.len().min(3);
+        ensure!(
+            max_replicas >= 1,
+            "randomized format profile requires at least one available device",
+        );
+
+        let replicas = rng.gen_range(1..=max_replicas);
+        let erasure_code =
+            replicas >= 2 && config.available_devices.len() >= 3 && rng.gen_bool(0.5);
+        let encrypted = rng.gen_bool(0.5);
+        let compression = if rng.gen_bool(0.5) {
+            Some("zstd:1")
+        } else {
+            None
+        };
+
+        let initial_member_count = if erasure_code {
+            replicas.max(3)
+        } else {
+            replicas
+        };
+
+        let mut available = config.available_devices.clone();
+        available.shuffle(&mut rng);
+
+        let mut initial_devices = available
+            .into_iter()
+            .take(initial_member_count)
+            .collect::<Vec<_>>();
+        sort_devices(&mut initial_devices);
+
+        let mut device_bucket_sizes = BTreeMap::new();
+
+        for device in &initial_devices {
+            let bucket_size = BUCKET_SIZES[rng.gen_range(0..BUCKET_SIZES.len())];
+            device_bucket_sizes.insert(device.clone(), bucket_size);
+        }
+
+        Ok(Self {
+            replicas,
+            erasure_code,
+            encrypted,
+            compression,
+            initial_devices,
+            device_bucket_sizes,
+        })
+    }
+
+    fn minimum_member_count(&self) -> usize {
+        if self.erasure_code {
+            self.replicas.max(3)
+        } else {
+            self.replicas
+        }
+    }
+}
+
+fn format_args_for_profile(profile: &FormatProfile) -> Vec<String> {
+    let mut args = vec![
+        "format".to_string(),
+        "-f".to_string(),
+        format!("--replicas={}", profile.replicas),
+    ];
+
+    if profile.erasure_code {
+        args.push("--erasure_code".to_string());
+    }
+
+    if profile.encrypted {
+        args.push("--encrypted".to_string());
+        args.push("--no_passphrase".to_string());
+    }
+
+    if let Some(compression) = profile.compression {
+        args.push(format!("--compression={compression}"));
+    }
+
+    for device in &profile.initial_devices {
+        if let Some(bucket_size) = profile.device_bucket_sizes.get(device) {
+            args.push(format!("--bucket_size={bucket_size}"));
+        }
+        args.push(device.clone());
+    }
+
+    args
+}
+
 fn resolve_available_device(device_name: &str, available_devices: &[String]) -> String {
     available_devices
         .iter()
@@ -1055,6 +1451,20 @@ fn resize_candidate_target_bytes(physical_bytes: u64) -> Result<Vec<u64>> {
     }
     targets.push(physical_bytes);
     Ok(targets)
+}
+
+fn active_device_sizes(
+    active_devices: &[String],
+    current_device_bytes: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    active_devices
+        .iter()
+        .filter_map(|device| {
+            current_device_bytes
+                .get(device)
+                .map(|bytes| (device.clone(), *bytes))
+        })
+        .collect()
 }
 
 fn classify_resize_outcome(used_bytes: u64, target_bytes: u64) -> Option<bool> {
