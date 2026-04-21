@@ -3,11 +3,12 @@ use clap::Parser;
 use proptest::{
     prelude::{BoxedStrategy, Just},
     prop_oneof,
-    strategy::{Strategy, ValueTree},
-    test_runner::TestRunner,
+    strategy::Strategy,
+    test_runner::{Config as ProptestConfig, TestCaseError, TestError, TestRunner},
 };
 use proptest_state_machine::strategy::Sequential;
 use std::{
+    cell::Cell,
     collections::BTreeSet,
     fs::{File, OpenOptions},
     io::Write,
@@ -34,6 +35,10 @@ struct Cli {
     /// Number of state-machine transitions to generate for this run.
     #[arg(long, default_value_t = 3)]
     operations: usize,
+
+    /// Number of generated test cases to execute.
+    #[arg(long, default_value_t = 32)]
+    cases: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +53,7 @@ struct Config {
     log_path: PathBuf,
     mountpoint: PathBuf,
     operations: usize,
+    cases: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +73,7 @@ impl TryFrom<Cli> for Config {
             "at least one --device is required",
         );
         ensure!(cli.operations > 0, "--operations must be at least 1");
+        ensure!(cli.cases > 0, "--cases must be at least 1");
         ensure_distinct_devices(&cli.available_devices)?;
 
         Ok(Self {
@@ -74,6 +81,7 @@ impl TryFrom<Cli> for Config {
             log_path: cli.log,
             mountpoint: cli.mountpoint,
             operations: cli.operations,
+            cases: cli.cases,
         })
     }
 }
@@ -121,8 +129,7 @@ impl Harness {
     fn new(config: &Config) -> Result<Self> {
         let log = OpenOptions::new()
             .create(true)
-            .truncate(true)
-            .write(true)
+            .append(true)
             .open(&config.log_path)
             .with_context(|| format!("failed to open log file {}", config.log_path.display()))?;
         let model = Model::from_config(config)?;
@@ -130,7 +137,11 @@ impl Harness {
         Ok(Self { model, log })
     }
 
-    fn run(&mut self, ops: &[Operation]) -> Result<()> {
+    fn run_case(&mut self, case_index: u32, ops: &[Operation]) -> Result<()> {
+        self.log_message(format!(
+            "INFO case_start index={} transitions={:?}",
+            case_index, ops
+        ))?;
         self.log_message(format!(
             "INFO phase=startup mounted_model={} active_member_devices={} available_devices={}",
             self.model.mounted,
@@ -161,6 +172,7 @@ impl Harness {
             "INFO phase=done mounted_model={}",
             self.model.mounted
         ))?;
+        self.log_message(format!("INFO case_done index={}", case_index))?;
         Ok(())
     }
 
@@ -248,35 +260,62 @@ impl Operation {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::try_from(cli)?;
-    let initial_model = Model::from_config(&config)?;
-    let transitions = generate_operations(&initial_model, config.operations)?;
-    let mut harness = Harness::new(&config)?;
-
-    harness.run(&transitions)
+    initialize_log_file(&config.log_path)?;
+    run_proptest_cases(&config)
 }
 
-fn generate_operations(initial_model: &Model, count: usize) -> Result<Vec<Operation>> {
-    let strategy = operation_sequence_strategy(initial_model.clone(), count);
-    let mut runner = TestRunner::deterministic();
-    let tree = strategy.new_tree(&mut runner).map_err(|reason| {
-        anyhow::anyhow!("failed to generate state-machine transitions: {reason}")
-    })?;
-    let (generated_initial_model, transitions, _seen_counter) = tree.current();
+fn run_proptest_cases(config: &Config) -> Result<()> {
+    let initial_model = Model::from_config(config)?;
+    let strategy = operation_sequence_strategy(initial_model.clone(), 1..=config.operations);
+    let mut runner = TestRunner::new(proptest_config(config.cases));
+    let case_index = Cell::new(0_u32);
 
-    ensure!(
-        generated_initial_model == *initial_model,
-        "generated initial state diverged from the requested runtime model",
+    let result = runner.run(
+        &strategy,
+        |(generated_initial_model, transitions, _seen_counter)| {
+            let current_case = case_index.get();
+            case_index.set(current_case + 1);
+
+            match run_generated_case(config, &generated_initial_model, &transitions, current_case) {
+                Ok(()) => Ok(()),
+                Err(err) => Err(TestCaseError::fail(format!("{err:#}"))),
+            }
+        },
     );
 
-    Ok(transitions)
+    match result {
+        Ok(()) => Ok(()),
+        Err(TestError::Fail(reason, value)) => {
+            append_failure_summary(&config.log_path, &reason.to_string(), &value)?;
+            bail!("proptest found a minimal failing case: {reason}; transitions={value:?}");
+        }
+        Err(TestError::Abort(reason)) => {
+            append_abort_summary(&config.log_path, &reason.to_string())?;
+            bail!("proptest aborted: {reason}");
+        }
+    }
+}
+
+fn run_generated_case(
+    config: &Config,
+    generated_initial_model: &Model,
+    transitions: &[Operation],
+    case_index: u32,
+) -> Result<()> {
+    let mut harness = Harness::new(config)?;
+    ensure!(
+        &harness.model == generated_initial_model,
+        "generated initial state diverged from the observed runtime model",
+    );
+    harness.run_case(case_index, transitions)
 }
 
 fn operation_sequence_strategy(
     initial_model: Model,
-    count: usize,
+    size: impl Into<proptest::collection::SizeRange>,
 ) -> Sequential<Model, Operation, BoxedStrategy<Model>, BoxedStrategy<Operation>> {
     Sequential::new(
-        (count..=count).into(),
+        size.into(),
         move || Just(initial_model.clone()).boxed(),
         |state, transition| state.supports(transition),
         operation_strategy,
@@ -297,6 +336,53 @@ fn ensure_distinct_devices(devices: &[String]) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn proptest_config(cases: u32) -> ProptestConfig {
+    let mut config = ProptestConfig::default();
+    config.cases = cases;
+    config.failure_persistence = None;
+    config
+}
+
+fn initialize_log_file(path: &Path) -> Result<()> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to initialize log file {}", path.display()))?;
+    Ok(())
+}
+
+fn append_failure_summary(
+    path: &Path,
+    reason: &str,
+    value: &(
+        Model,
+        Vec<Operation>,
+        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ),
+) -> Result<()> {
+    let mut log = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to append failure summary to {}", path.display()))?;
+    writeln!(log, "ERROR proptest_failure reason={reason}")
+        .context("failed to write proptest failure reason")?;
+    writeln!(log, "ERROR proptest_failure_value {value:?}")
+        .context("failed to write proptest failure value")?;
+    Ok(())
+}
+
+fn append_abort_summary(path: &Path, reason: &str) -> Result<()> {
+    let mut log = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to append abort summary to {}", path.display()))?;
+    writeln!(log, "ERROR proptest_abort reason={reason}")
+        .context("failed to write proptest abort reason")?;
     Ok(())
 }
 
