@@ -10,14 +10,10 @@ config-scratch-devs 1G
 
 test_basic_loop()
 {
-    local active_dev=${ktest_scratch_dev[0]}
     local args=()
     local dev
 
-    set_watchdog 60
-
-    run_quiet "" bcachefs format -f "$active_dev"
-    mount -t bcachefs "$active_dev" /mnt
+    set_watchdog 180
 
     for dev in "${ktest_scratch_dev[@]}"; do
 	args+=(--device "$dev")
@@ -26,16 +22,8 @@ test_basic_loop()
     continuous-bcachefs-test				\
 	"${args[@]}"					\
 	--log "$ktest_out/continuous-basic.log"		\
-	--mountpoint /mnt
-
-    umount /mnt
-
-    bcachefs fsck -ny "$active_dev"
-
-    mount -t bcachefs "$active_dev" /mnt
-    umount /mnt
-
-    bcachefs_test_end_checks "$active_dev"
+	--mountpoint /mnt				\
+	--cases 4
 }
 
 main "$@"
