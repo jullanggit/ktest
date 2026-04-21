@@ -55,6 +55,7 @@ enum Operation {
         device: String,
         target_bytes: u64,
     },
+    ToggleFileChurn,
     SetTarget {
         kind: TargetKind,
         label: DeviceLabel,
@@ -164,6 +165,15 @@ struct LatestResizeResult {
 }
 
 #[derive(Debug)]
+struct BackgroundWorker {
+    name: &'static str,
+    child: Child,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
 struct InflightOperation {
     id: u64,
     op: Operation,
@@ -183,6 +193,7 @@ struct Harness {
     log: File,
     latest_resize_results: BTreeMap<String, LatestResizeResult>,
     current_profile: Option<FormatProfile>,
+    file_churn: Option<BackgroundWorker>,
 }
 
 impl TryFrom<Cli> for Config {
@@ -240,6 +251,7 @@ impl Harness {
             log,
             latest_resize_results: BTreeMap::new(),
             current_profile: None,
+            file_churn: None,
         })
     }
 
@@ -336,15 +348,25 @@ impl Harness {
                     if !candidates.is_empty() && (inflight.is_empty() || rng.gen_bool(0.5)) {
                         let op = candidates[rng.gen_range(0..candidates.len())].clone();
                         let expected = self.expected_outcome(&observation, &inflight, &op)?;
-                        self.mark_superseded(&mut inflight, &op)?;
-                        let spawned = self.spawn_operation(
-                            next_op_id,
-                            &observation,
-                            &inflight,
-                            &op,
-                            expected,
-                        )?;
-                        inflight.push(spawned);
+                        if self.is_immediate_operation(&op) {
+                            self.perform_immediate_operation(
+                                next_op_id,
+                                &observation,
+                                &inflight,
+                                &op,
+                                expected,
+                            )?;
+                        } else {
+                            self.mark_superseded(&mut inflight, &op)?;
+                            let spawned = self.spawn_operation(
+                                next_op_id,
+                                &observation,
+                                &inflight,
+                                &op,
+                                expected,
+                            )?;
+                            inflight.push(spawned);
+                        }
                         launched += 1;
                         next_op_id += 1;
                     }
@@ -355,20 +377,36 @@ impl Harness {
                 }
             }
 
+            self.stop_workers(false)?;
+            let observed = self.snapshot_state("after_stop_workers")?;
+            self.assert_live_properties(&observed)?;
+            self.assert_quiescent_properties(&observed)?;
+
             Ok(())
         })();
 
         let abort_result = self.abort_inflight(&mut inflight);
+        let stop_workers_result = self.stop_workers(true);
 
-        match (loop_result, abort_result) {
-            (Ok(()), Ok(())) => {
+        match (loop_result, abort_result, stop_workers_result) {
+            (Ok(()), Ok(()), Ok(())) => {
                 self.log_message(format!("INFO case_done index={}", case_index))?;
                 Ok(())
             }
-            (Err(case_err), Ok(())) => Err(case_err),
-            (Ok(()), Err(abort_err)) => Err(abort_err),
-            (Err(case_err), Err(abort_err)) => Err(case_err.context(format!(
+            (Err(case_err), Ok(()), Ok(())) => Err(case_err),
+            (Ok(()), Err(abort_err), Ok(())) => Err(abort_err),
+            (Ok(()), Ok(()), Err(stop_err)) => Err(stop_err),
+            (Err(case_err), Err(abort_err), Ok(())) => Err(case_err.context(format!(
                 "aborting inflight operations also failed: {abort_err:#}"
+            ))),
+            (Err(case_err), Ok(()), Err(stop_err)) => Err(case_err.context(format!(
+                "stopping workers also failed: {stop_err:#}"
+            ))),
+            (Ok(()), Err(abort_err), Err(stop_err)) => Err(abort_err.context(format!(
+                "stopping workers also failed: {stop_err:#}"
+            ))),
+            (Err(case_err), Err(abort_err), Err(stop_err)) => Err(case_err.context(format!(
+                "aborting inflight operations also failed: {abort_err:#}; stopping workers also failed: {stop_err:#}"
             ))),
         }
     }
@@ -420,7 +458,7 @@ impl Harness {
         }
 
         self.assert_live_properties(&after)?;
-        if quiescent {
+        if quiescent && !self.has_active_workers() {
             self.assert_quiescent_properties(&after)?;
         }
 
@@ -434,6 +472,55 @@ impl Harness {
             op.before.used_bytes,
             after.used_bytes,
             format_operations(&op.concurrent_at_spawn),
+            after.active_member_devices.join(","),
+            format_device_sizes(&after.active_member_devices, &after.device_sizes),
+        ))?;
+
+        Ok(())
+    }
+
+    fn is_immediate_operation(&self, op: &Operation) -> bool {
+        matches!(op, Operation::ToggleFileChurn)
+    }
+
+    fn perform_immediate_operation(
+        &mut self,
+        id: u64,
+        before: &Observation,
+        inflight: &[InflightOperation],
+        op: &Operation,
+        expected: ExpectedOutcome,
+    ) -> Result<()> {
+        let concurrent_ops = inflight.iter().map(|op| op.op.clone()).collect::<Vec<_>>();
+        self.log_message(format!(
+            "INFO op_spawn id={} op={op:?} before_used_bytes={} before_active_member_devices={} before_device_sizes={} concurrent={} expected={expected:?}",
+            id,
+            before.used_bytes,
+            before.active_member_devices.join(","),
+            format_device_sizes(&before.active_member_devices, &before.device_sizes),
+            format_operations(&concurrent_ops),
+        ))?;
+
+        let started_at = Instant::now();
+        match op {
+            Operation::ToggleFileChurn => self.toggle_file_churn(id)?,
+            _ => bail!("non-immediate operation routed to perform_immediate_operation: {op:?}"),
+        }
+
+        let after = self.snapshot_state("after_immediate_op")?;
+        self.assert_expected_outcome(op, &expected, true, &after)?;
+        self.assert_live_properties(&after)?;
+        if inflight.is_empty() && !self.has_active_workers() {
+            self.assert_quiescent_properties(&after)?;
+        }
+
+        self.log_message(format!(
+            "INFO op_done id={} op={op:?} superseded=false success=true duration_ms={} before_used_bytes={} after_used_bytes={} concurrent_at_spawn={} active_member_devices={} device_sizes={}",
+            id,
+            started_at.elapsed().as_millis(),
+            before.used_bytes,
+            after.used_bytes,
+            format_operations(&concurrent_ops),
             after.active_member_devices.join(","),
             format_device_sizes(&after.active_member_devices, &after.device_sizes),
         ))?;
@@ -489,6 +576,11 @@ impl Harness {
         }
 
         if !topology_locked {
+            let file_churn_weight = if self.file_churn.is_some() { 1 } else { 3 };
+            for _ in 0..file_churn_weight {
+                operations.push(Operation::ToggleFileChurn);
+            }
+
             let legal_labels = observation
                 .device_labels
                 .values()
@@ -635,6 +727,17 @@ impl Harness {
                     required_device_labels,
                 }
             }
+            Operation::ToggleFileChurn => ExpectedObservation {
+                mounted: true,
+                active_member_devices: Some(before.active_member_devices.clone()),
+                required_device_sizes: if concurrent_resize {
+                    BTreeMap::new()
+                } else {
+                    before.device_sizes.clone()
+                },
+                required_targets: before.targets.clone(),
+                required_device_labels: before.device_labels.clone(),
+            },
             Operation::SetTarget { kind, label } => {
                 let mut required_targets = BTreeMap::new();
                 required_targets.insert(*kind, Some(*label));
@@ -684,6 +787,7 @@ impl Harness {
         let require_success = match operation {
             Operation::AddDevice(_)
             | Operation::RemoveDevice(_)
+            | Operation::ToggleFileChurn
             | Operation::SetTarget { .. }
             | Operation::SetDeviceLabel { .. } => Some(true),
             Operation::ResizeDevice { target_bytes, .. } => {
@@ -816,6 +920,9 @@ impl Harness {
                 cmd.args(["-lc", script.as_str()]);
                 cmd
             }
+            Operation::ToggleFileChurn => {
+                bail!("toggle worker operation reached async spawn path");
+            }
         };
 
         let child = command
@@ -855,6 +962,112 @@ impl Harness {
             ))?;
         }
         Ok(())
+    }
+
+    fn has_active_workers(&self) -> bool {
+        self.file_churn.is_some()
+    }
+
+    fn toggle_file_churn(&mut self, id: u64) -> Result<()> {
+        if self.file_churn.is_some() {
+            self.stop_file_churn(id, false)
+        } else {
+            self.start_file_churn(id)
+        }
+    }
+
+    fn start_file_churn(&mut self, id: u64) -> Result<()> {
+        ensure!(
+            self.file_churn.is_none(),
+            "file churn worker already running",
+        );
+
+        let output_dir = self
+            .config
+            .log_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/tmp"));
+        let stdout_path = output_dir.join(format!("continuous-file-churn-{id}.stdout"));
+        let stderr_path = output_dir.join(format!("continuous-file-churn-{id}.stderr"));
+        let stdout = File::create(&stdout_path)
+            .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+        let stderr = File::create(&stderr_path)
+            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+        let churn_dir = self.config.mountpoint.join("continuous-file-churn");
+        let churn_dir_str = churn_dir.to_str().with_context(|| {
+            format!(
+                "file churn directory is not valid utf-8: {}",
+                churn_dir.display()
+            )
+        })?;
+        let script = format!(
+            "set -euo pipefail\n\
+             dir={dir}\n\
+             mkdir -p \"$dir\"\n\
+             i=0\n\
+             while true; do\n\
+                 file=\"$dir/file-$i\"\n\
+                 tmp=\"$file.tmp\"\n\
+                 printf '%s\\n' \"$i\" > \"$tmp\"\n\
+                 mv \"$tmp\" \"$file\"\n\
+                 rm -f \"$file\"\n\
+                 i=$(( (i + 1) % 256 ))\n\
+             done",
+            dir = shell_quote(churn_dir_str),
+        );
+
+        let child = Command::new("bash")
+            .args(["-lc", script.as_str()])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .context("failed to spawn file churn worker")?;
+
+        self.file_churn = Some(BackgroundWorker {
+            name: "file_churn",
+            child,
+            stdout_path,
+            stderr_path,
+            started_at: Instant::now(),
+        });
+        self.log_message(format!("INFO worker_start id={} name=file_churn", id))?;
+        Ok(())
+    }
+
+    fn stop_file_churn(&mut self, id: u64, implicit: bool) -> Result<()> {
+        let Some(mut worker) = self.file_churn.take() else {
+            return Ok(());
+        };
+
+        self.log_message(format!(
+            "INFO worker_stop id={} name={} implicit={} duration_ms={}",
+            id,
+            worker.name,
+            implicit,
+            worker.started_at.elapsed().as_millis(),
+        ))?;
+        let _ = worker.child.kill();
+        let status = worker
+            .child
+            .wait()
+            .with_context(|| format!("failed to wait for {} worker", worker.name))?;
+        append_output_file(&mut self.log, id, "worker_stdout", &worker.stdout_path)?;
+        append_output_file(&mut self.log, id, "worker_stderr", &worker.stderr_path)?;
+        let _ = fs::remove_file(&worker.stdout_path);
+        let _ = fs::remove_file(&worker.stderr_path);
+        let churn_dir = self.config.mountpoint.join("continuous-file-churn");
+        let _ = fs::remove_dir_all(churn_dir);
+        self.log_message(format!(
+            "INFO worker_stopped id={} name={} status={}",
+            id,
+            worker.name,
+            render_status(status),
+        ))?;
+        Ok(())
+    }
+
+    fn stop_workers(&mut self, implicit: bool) -> Result<()> {
+        self.stop_file_churn(u64::MAX, implicit)
     }
 
     fn append_operation_output(&mut self, op: &InflightOperation) -> Result<()> {
@@ -954,7 +1167,9 @@ impl Harness {
             Operation::AddDevice(device) | Operation::RemoveDevice(device) => {
                 self.latest_resize_results.remove(device);
             }
-            Operation::SetTarget { .. } | Operation::SetDeviceLabel { .. } => {}
+            Operation::ToggleFileChurn
+            | Operation::SetTarget { .. }
+            | Operation::SetDeviceLabel { .. } => {}
             Operation::ResizeDevice {
                 device,
                 target_bytes,
