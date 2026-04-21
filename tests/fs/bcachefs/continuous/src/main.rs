@@ -1,5 +1,6 @@
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -115,40 +116,6 @@ struct Harness {
     config: Config,
     log: File,
     latest_resize_results: BTreeMap<String, LatestResizeResult>,
-}
-
-#[derive(Clone, Debug)]
-struct SimpleRng {
-    state: u64,
-}
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        let state = if seed == 0 {
-            0x9e37_79b9_7f4a_7c15
-        } else {
-            seed
-        };
-        Self { state }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
-    }
-
-    fn index(&mut self, len: usize) -> usize {
-        debug_assert!(len > 0);
-        (self.next_u64() as usize) % len
-    }
-
-    fn should_spawn(&mut self, inflight_empty: bool) -> bool {
-        inflight_empty || (self.next_u64() & 1) == 0
-    }
 }
 
 impl TryFrom<Cli> for Config {
@@ -274,7 +241,7 @@ impl Harness {
             self.config.spawn_interval_ms,
         ))?;
 
-        let mut rng = SimpleRng::new(seed);
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut inflight = Vec::new();
         let mut launched = 0_usize;
         let mut next_op_id = 0_u64;
@@ -295,8 +262,8 @@ impl Harness {
                         );
                     }
 
-                    if !candidates.is_empty() && rng.should_spawn(inflight.is_empty()) {
-                        let op = candidates[rng.index(candidates.len())].clone();
+                    if !candidates.is_empty() && (inflight.is_empty() || rng.gen_bool(0.5)) {
+                        let op = candidates[rng.gen_range(0..candidates.len())].clone();
                         let expected = self.expected_outcome(&observation, &op)?;
                         self.mark_superseded(&mut inflight, &op)?;
                         let spawned = self.spawn_operation(
