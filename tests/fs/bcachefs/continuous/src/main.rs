@@ -1,20 +1,13 @@
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
-use proptest::{
-    prelude::{BoxedStrategy, Just},
-    sample::select,
-    strategy::Strategy,
-    test_runner::{Config as ProptestConfig, TestCaseError, TestError, TestRunner},
-};
-use proptest_state_machine::strategy::Sequential;
 use std::{
-    cell::Cell,
     collections::{BTreeMap, BTreeSet},
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output},
-    time::Instant,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Parser, Debug)]
@@ -32,13 +25,25 @@ struct Cli {
     #[arg(long)]
     mountpoint: PathBuf,
 
-    /// Number of state-machine transitions to generate for this run.
+    /// Number of operations to launch per case.
     #[arg(long, default_value_t = 3)]
     operations: usize,
 
-    /// Number of generated test cases to execute.
+    /// Number of fresh filesystem cases to execute.
     #[arg(long, default_value_t = 32)]
     cases: u32,
+
+    /// Deterministic seed for operation scheduling.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    /// Maximum number of concurrent in-flight operations.
+    #[arg(long, default_value_t = 3)]
+    max_inflight: usize,
+
+    /// Manager polling/spawn interval in milliseconds.
+    #[arg(long, default_value_t = 200)]
+    spawn_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,13 +62,9 @@ struct Config {
     mountpoint: PathBuf,
     operations: usize,
     cases: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Model {
-    available_devices: Vec<String>,
-    active_member_devices: Vec<String>,
-    current_device_bytes: BTreeMap<String, u64>,
+    seed: u64,
+    max_inflight: usize,
+    spawn_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,8 +79,8 @@ struct Observation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExpectedObservation {
     mounted: bool,
-    active_member_devices: Vec<String>,
-    device_sizes: BTreeMap<String, u64>,
+    active_member_devices: Option<Vec<String>>,
+    required_device_sizes: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +88,67 @@ struct ExpectedOutcome {
     require_success: Option<bool>,
     on_success: ExpectedObservation,
     on_failure: ExpectedObservation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LatestResizeResult {
+    target_bytes: u64,
+    completed_success: bool,
+}
+
+#[derive(Debug)]
+struct InflightOperation {
+    id: u64,
+    op: Operation,
+    before: Observation,
+    concurrent_at_spawn: Vec<Operation>,
+    expected: ExpectedOutcome,
+    child: Child,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    superseded: bool,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct Harness {
+    config: Config,
+    log: File,
+    latest_resize_results: BTreeMap<String, LatestResizeResult>,
+}
+
+#[derive(Clone, Debug)]
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        let state = if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        };
+        Self { state }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    fn index(&mut self, len: usize) -> usize {
+        debug_assert!(len > 0);
+        (self.next_u64() as usize) % len
+    }
+
+    fn should_spawn(&mut self, inflight_empty: bool) -> bool {
+        inflight_empty || (self.next_u64() & 1) == 0
+    }
 }
 
 impl TryFrom<Cli> for Config {
@@ -103,6 +165,7 @@ impl TryFrom<Cli> for Config {
         );
         ensure!(cli.operations > 0, "--operations must be at least 1");
         ensure!(cli.cases > 0, "--cases must be at least 1");
+        ensure!(cli.max_inflight > 0, "--max-inflight must be at least 1");
         ensure_distinct_devices(&cli.available_devices)?;
 
         let mut device_physical_bytes = BTreeMap::new();
@@ -123,83 +186,11 @@ impl TryFrom<Cli> for Config {
             mountpoint: cli.mountpoint,
             operations: cli.operations,
             cases: cli.cases,
+            seed: cli.seed,
+            max_inflight: cli.max_inflight,
+            spawn_interval_ms: cli.spawn_interval_ms,
         })
     }
-}
-
-impl Model {
-    fn initial(config: &Config) -> Self {
-        let mut active_member_devices = vec![config.available_devices[0].clone()];
-        sort_devices(&mut active_member_devices);
-
-        Self {
-            available_devices: config.available_devices.clone(),
-            active_member_devices,
-            current_device_bytes: config.device_physical_bytes.clone(),
-        }
-    }
-
-    fn supports(&self, operation: &Operation) -> bool {
-        match operation {
-            Operation::AddDevice(device) => {
-                !self.active_member_devices.contains(device)
-                    && self.available_devices.contains(device)
-            }
-            Operation::RemoveDevice(device) => {
-                self.active_member_devices.len() > 1 && self.active_member_devices.contains(device)
-            }
-            Operation::ResizeDevice {
-                device,
-                target_bytes,
-            } => {
-                self.active_member_devices.contains(device)
-                    && self
-                        .current_device_bytes
-                        .get(device)
-                        .is_some_and(|current| current != target_bytes)
-            }
-        }
-    }
-
-    fn apply_transition(
-        &self,
-        device_physical_bytes: &BTreeMap<String, u64>,
-        operation: &Operation,
-    ) -> Self {
-        let mut next = self.clone();
-
-        match operation {
-            Operation::AddDevice(device) => {
-                if !next.active_member_devices.contains(device) {
-                    next.active_member_devices.push(device.clone());
-                    sort_devices(&mut next.active_member_devices);
-                }
-                if let Some(physical_bytes) = device_physical_bytes.get(device) {
-                    next.current_device_bytes
-                        .insert(device.clone(), *physical_bytes);
-                }
-            }
-            Operation::RemoveDevice(device) => {
-                next.active_member_devices.retain(|d| d != device);
-            }
-            Operation::ResizeDevice {
-                device,
-                target_bytes,
-            } => {
-                next.current_device_bytes
-                    .insert(device.clone(), *target_bytes);
-            }
-        }
-
-        next
-    }
-}
-
-#[derive(Debug)]
-struct Harness {
-    config: Config,
-    model: Model,
-    log: File,
 }
 
 impl Harness {
@@ -212,14 +203,14 @@ impl Harness {
 
         Ok(Self {
             config: config.clone(),
-            model: Model::initial(config),
             log,
+            latest_resize_results: BTreeMap::new(),
         })
     }
 
     fn prepare_fresh_filesystem(&mut self) -> Result<()> {
+        self.latest_resize_results.clear();
         self.cleanup_mountpoint()?;
-        self.model = Model::initial(&self.config);
 
         let primary_device = self.config.available_devices[0].clone();
         let mountpoint = self.mountpoint_str()?.to_owned();
@@ -246,7 +237,21 @@ impl Harness {
         )?;
 
         let observed = self.snapshot_state("after_prepare")?;
-        self.assert_model_matches_observation(&observed)?;
+        ensure!(
+            observed.mounted,
+            "expected the test filesystem to be mounted after prepare",
+        );
+        ensure!(
+            observed.active_member_devices == vec![primary_device.clone()],
+            "unexpected initial topology after prepare: {:?}",
+            observed,
+        );
+        ensure!(
+            observed.device_sizes.get(&primary_device)
+                == self.config.device_physical_bytes.get(&primary_device),
+            "unexpected initial device size after prepare: {:?}",
+            observed,
+        );
         Ok(())
     }
 
@@ -259,97 +264,272 @@ impl Harness {
         Ok(())
     }
 
-    fn run_case(&mut self, case_index: u32, ops: &[Operation]) -> Result<()> {
+    fn run_case(&mut self, case_index: u32, seed: u64) -> Result<()> {
         self.log_message(format!(
-            "INFO case_start index={} transitions={:?}",
-            case_index, ops
+            "INFO case_start index={} seed={} operations={} max_inflight={} spawn_interval_ms={}",
+            case_index,
+            seed,
+            self.config.operations,
+            self.config.max_inflight,
+            self.config.spawn_interval_ms,
         ))?;
 
-        let initial = self.snapshot_state("case_start")?;
-        self.assert_model_matches_observation(&initial)?;
+        let mut rng = SimpleRng::new(seed);
+        let mut inflight = Vec::new();
+        let mut launched = 0_usize;
+        let mut next_op_id = 0_u64;
 
-        for (index, op) in ops.iter().enumerate() {
-            let start = Instant::now();
-            let before = self.snapshot_state("before_op")?;
-            let expected = self.expected_observation_after(&before, op)?;
+        let loop_result = (|| -> Result<()> {
+            while launched < self.config.operations || !inflight.is_empty() {
+                self.reap_completed(&mut inflight)?;
 
-            self.log_message(format!(
-                "INFO op_start index={} op={op:?} before_active_member_devices={} before_sizes={} used_bytes={} expected={expected:?}",
-                index,
-                before.active_member_devices.join(","),
-                format_device_sizes(&self.model.active_member_devices, &self.model.current_device_bytes),
-                before.used_bytes,
-            ))?;
+                if launched < self.config.operations && inflight.len() < self.config.max_inflight {
+                    let observation = self.snapshot_state("manager_tick")?;
+                    let candidates = self.operation_candidates(&observation, &inflight);
 
-            let success = self.execute_operation(op, &before)?;
-            let after = self.snapshot_state("after_op")?;
-            self.assert_expected_outcome(op, &expected, success, &after)?;
-            self.assert_properties(&after)?;
-            if success {
-                self.model = self
-                    .model
-                    .apply_transition(&self.config.device_physical_bytes, op);
+                    if candidates.is_empty() && inflight.is_empty() {
+                        bail!(
+                            "manager ran out of legal operations with {} launches remaining; observation={:?}",
+                            self.config.operations - launched,
+                            observation,
+                        );
+                    }
+
+                    if !candidates.is_empty() && rng.should_spawn(inflight.is_empty()) {
+                        let op = candidates[rng.index(candidates.len())].clone();
+                        let expected = self.expected_outcome(&observation, &op)?;
+                        self.mark_superseded(&mut inflight, &op)?;
+                        let spawned = self.spawn_operation(
+                            next_op_id,
+                            &observation,
+                            &inflight,
+                            &op,
+                            expected,
+                        )?;
+                        inflight.push(spawned);
+                        launched += 1;
+                        next_op_id += 1;
+                    }
+                }
+
+                if launched < self.config.operations || !inflight.is_empty() {
+                    thread::sleep(Duration::from_millis(self.config.spawn_interval_ms));
+                }
             }
 
-            self.log_message(format!(
-                "INFO op_ok index={} op={op:?} success={} duration_ms={} active_member_devices={} model_sizes={}",
-                index,
-                success,
-                start.elapsed().as_millis(),
-                after.active_member_devices.join(","),
-                format_device_sizes(&self.model.active_member_devices, &self.model.current_device_bytes),
-            ))?;
+            Ok(())
+        })();
+
+        let abort_result = self.abort_inflight(&mut inflight);
+
+        match (loop_result, abort_result) {
+            (Ok(()), Ok(())) => {
+                self.log_message(format!("INFO case_done index={}", case_index))?;
+                Ok(())
+            }
+            (Err(case_err), Ok(())) => Err(case_err),
+            (Ok(()), Err(abort_err)) => Err(abort_err),
+            (Err(case_err), Err(abort_err)) => Err(case_err.context(format!(
+                "aborting inflight operations also failed: {abort_err:#}"
+            ))),
+        }
+    }
+
+    fn reap_completed(&mut self, inflight: &mut Vec<InflightOperation>) -> Result<()> {
+        loop {
+            let mut completed_index = None;
+
+            for (index, op) in inflight.iter_mut().enumerate() {
+                if let Some(status) = op
+                    .child
+                    .try_wait()
+                    .with_context(|| format!("failed to poll in-flight operation {}", op.id))?
+                {
+                    completed_index = Some((index, status));
+                    break;
+                }
+            }
+
+            let Some((index, status)) = completed_index else {
+                return Ok(());
+            };
+
+            let op = inflight.remove(index);
+            let quiescent = inflight.is_empty();
+            self.finish_operation(op, status, quiescent)?;
+        }
+    }
+
+    fn finish_operation(
+        &mut self,
+        op: InflightOperation,
+        status: ExitStatus,
+        quiescent: bool,
+    ) -> Result<()> {
+        self.append_operation_output(&op)?;
+        let after = self.snapshot_state("after_op")?;
+        let success = status.success();
+
+        if op.superseded {
+            ensure!(
+                after.mounted,
+                "superseded operation {:?} left the filesystem unmounted",
+                op.op,
+            );
+        } else {
+            self.assert_expected_outcome(&op.op, &op.expected, success, &after)?;
+            self.record_latest_resize_result(&op.op, success);
         }
 
-        self.log_message(format!("INFO case_done index={}", case_index))?;
+        self.assert_live_properties(&after)?;
+        if quiescent {
+            self.assert_quiescent_properties(&after)?;
+        }
+
+        self.log_message(format!(
+            "INFO op_done id={} op={:?} superseded={} success={} duration_ms={} before_used_bytes={} after_used_bytes={} concurrent_at_spawn={} active_member_devices={} device_sizes={}",
+            op.id,
+            op.op,
+            op.superseded,
+            success,
+            op.started_at.elapsed().as_millis(),
+            op.before.used_bytes,
+            after.used_bytes,
+            format_operations(&op.concurrent_at_spawn),
+            after.active_member_devices.join(","),
+            format_device_sizes(&after.active_member_devices, &after.device_sizes),
+        ))?;
+
         Ok(())
     }
 
-    fn expected_observation_after(
+    fn operation_candidates(
+        &self,
+        observation: &Observation,
+        inflight: &[InflightOperation],
+    ) -> Vec<Operation> {
+        if !observation.mounted {
+            return Vec::new();
+        }
+
+        let topology_locked = inflight
+            .iter()
+            .any(|op| !matches!(op.op, Operation::ResizeDevice { .. }));
+        let mut operations = Vec::new();
+
+        /*
+         * Add/remove change the member set directly, so the current harness only
+         * issues them from a quiescent topology state. Resizes stay async and
+         * may overlap each other so the manager can exercise superseding
+         * requests on one device without also having to reason about concurrent
+         * membership churn yet.
+         */
+        if !topology_locked && inflight.is_empty() {
+            for device in &self.config.available_devices {
+                if !observation.active_member_devices.contains(device) {
+                    operations.push(Operation::AddDevice(device.clone()));
+                }
+            }
+
+            if observation.active_member_devices.len() > 1 {
+                for device in &observation.active_member_devices {
+                    operations.push(Operation::RemoveDevice(device.clone()));
+                }
+            }
+        }
+
+        if !topology_locked {
+            for device in &observation.active_member_devices {
+                let Some(&current_bytes) = observation.device_sizes.get(device) else {
+                    continue;
+                };
+                let Some(targets) = self.config.device_resize_targets.get(device) else {
+                    continue;
+                };
+
+                for &target_bytes in targets {
+                    if target_bytes == current_bytes {
+                        continue;
+                    }
+                    if inflight.iter().any(|op| {
+                        matches!(
+                            op.op,
+                            Operation::ResizeDevice {
+                                device: ref inflight_device,
+                                target_bytes: inflight_target,
+                            } if inflight_device == device && inflight_target == target_bytes
+                        )
+                    }) {
+                        continue;
+                    }
+                    operations.push(Operation::ResizeDevice {
+                        device: device.clone(),
+                        target_bytes,
+                    });
+                }
+            }
+        }
+
+        operations
+    }
+
+    fn expected_outcome(
         &self,
         before: &Observation,
         operation: &Operation,
     ) -> Result<ExpectedOutcome> {
         ensure!(before.mounted, "operations require a mounted filesystem");
-        ensure!(
-            self.model.active_member_devices == before.active_member_devices,
-            "generator model diverged from observed active members before operation",
-        );
-        ensure!(
-            active_device_sizes(
-                &self.model.active_member_devices,
-                &self.model.current_device_bytes
-            ) == before.device_sizes,
-            "generator model diverged from observed device sizes: model={:?}, observed={:?}",
-            active_device_sizes(
-                &self.model.active_member_devices,
-                &self.model.current_device_bytes
-            ),
-            before.device_sizes,
-        );
-        ensure!(
-            self.model.supports(operation),
-            "generator produced an operation unsupported by the current model: {operation:?}",
-        );
 
-        let next_model = self
-            .model
-            .apply_transition(&self.config.device_physical_bytes, operation);
         let on_failure = ExpectedObservation {
             mounted: true,
-            active_member_devices: self.model.active_member_devices.clone(),
-            device_sizes: active_device_sizes(
-                &self.model.active_member_devices,
-                &self.model.current_device_bytes,
-            ),
+            active_member_devices: Some(before.active_member_devices.clone()),
+            required_device_sizes: before.device_sizes.clone(),
         };
-        let on_success = ExpectedObservation {
-            mounted: true,
-            device_sizes: active_device_sizes(
-                &next_model.active_member_devices,
-                &next_model.current_device_bytes,
-            ),
-            active_member_devices: next_model.active_member_devices,
+
+        let on_success = match operation {
+            Operation::AddDevice(device) => {
+                let mut active = before.active_member_devices.clone();
+                active.push(device.clone());
+                sort_devices(&mut active);
+
+                let mut required_device_sizes = before.device_sizes.clone();
+                let physical_bytes = self
+                    .config
+                    .device_physical_bytes
+                    .get(device)
+                    .copied()
+                    .with_context(|| format!("missing physical size for {device}"))?;
+                required_device_sizes.insert(device.clone(), physical_bytes);
+
+                ExpectedObservation {
+                    mounted: true,
+                    active_member_devices: Some(active),
+                    required_device_sizes,
+                }
+            }
+            Operation::RemoveDevice(device) => {
+                let mut active = before.active_member_devices.clone();
+                active.retain(|d| d != device);
+
+                let mut required_device_sizes = before.device_sizes.clone();
+                required_device_sizes.remove(device);
+
+                ExpectedObservation {
+                    mounted: true,
+                    active_member_devices: Some(active),
+                    required_device_sizes,
+                }
+            }
+            /*
+             * Concurrent resizes may complete in either order, so immediate
+             * per-op checks only pin the member set. The final size convergence
+             * check runs once the manager reaches a quiescent point.
+             */
+            Operation::ResizeDevice { .. } => ExpectedObservation {
+                mounted: true,
+                active_member_devices: Some(before.active_member_devices.clone()),
+                required_device_sizes: BTreeMap::new(),
+            },
         };
 
         let require_success = match operation {
@@ -366,59 +546,140 @@ impl Harness {
         })
     }
 
-    fn execute_operation(&mut self, operation: &Operation, before: &Observation) -> Result<bool> {
-        match operation {
+    fn mark_superseded(
+        &mut self,
+        inflight: &mut [InflightOperation],
+        new_op: &Operation,
+    ) -> Result<()> {
+        let Operation::ResizeDevice { device, .. } = new_op else {
+            return Ok(());
+        };
+
+        for old in inflight.iter_mut() {
+            if matches!(&old.op, Operation::ResizeDevice { device: old_device, .. } if old_device == device)
+            {
+                old.superseded = true;
+                self.log_message(format!(
+                    "INFO op_superseded old_id={} old_op={:?} new_op={new_op:?}",
+                    old.id, old.op,
+                ))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn spawn_operation(
+        &mut self,
+        id: u64,
+        before: &Observation,
+        inflight: &[InflightOperation],
+        op: &Operation,
+        expected: ExpectedOutcome,
+    ) -> Result<InflightOperation> {
+        let mountpoint = self.mountpoint_str()?.to_owned();
+        let output_dir = self
+            .config
+            .log_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/tmp"));
+        let stdout_path = output_dir.join(format!("continuous-op-{id}.stdout"));
+        let stderr_path = output_dir.join(format!("continuous-op-{id}.stderr"));
+        let stdout = File::create(&stdout_path)
+            .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+        let stderr = File::create(&stderr_path)
+            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+
+        let concurrent_ops = inflight.iter().map(|op| op.op.clone()).collect::<Vec<_>>();
+        self.log_message(format!(
+            "INFO op_spawn id={} op={op:?} before_used_bytes={} before_active_member_devices={} before_device_sizes={} concurrent={} expected={expected:?}",
+            id,
+            before.used_bytes,
+            before.active_member_devices.join(","),
+            format_device_sizes(&before.active_member_devices, &before.device_sizes),
+            format_operations(&concurrent_ops),
+        ))?;
+
+        let mut command = match op {
             Operation::AddDevice(device) => {
-                self.add_device(device)?;
-                Ok(true)
+                let mut cmd = Command::new("bcachefs");
+                cmd.args(["device", "add", "-f", mountpoint.as_str(), device.as_str()]);
+                cmd
             }
             Operation::RemoveDevice(device) => {
-                self.remove_device(before, device)?;
-                Ok(true)
+                let dev_idx = before
+                    .device_indices
+                    .get(device)
+                    .copied()
+                    .with_context(|| {
+                        format!("missing device index for removable member {device}")
+                    })?;
+                let script = format!(
+                    "bcachefs device evacuate {} && bcachefs device remove {} {}",
+                    shell_quote(device),
+                    dev_idx,
+                    shell_quote(&mountpoint),
+                );
+                let mut cmd = Command::new("bash");
+                cmd.args(["-lc", script.as_str()]);
+                cmd
             }
             Operation::ResizeDevice {
                 device,
                 target_bytes,
-            } => self.resize_device(device, *target_bytes),
+            } => {
+                let target = target_bytes.to_string();
+                let mut cmd = Command::new("bcachefs");
+                cmd.args(["device", "resize", device.as_str(), target.as_str()]);
+                cmd
+            }
+        };
+
+        let child = command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .with_context(|| format!("failed to spawn operation {op:?}"))?;
+
+        Ok(InflightOperation {
+            id,
+            op: op.clone(),
+            before: before.clone(),
+            concurrent_at_spawn: concurrent_ops,
+            expected,
+            child,
+            stdout_path,
+            stderr_path,
+            superseded: false,
+            started_at: Instant::now(),
+        })
+    }
+
+    fn abort_inflight(&mut self, inflight: &mut Vec<InflightOperation>) -> Result<()> {
+        while let Some(mut op) = inflight.pop() {
+            self.log_message(format!("INFO op_abort id={} op={:?}", op.id, op.op))?;
+            let _ = op.child.kill();
+            let status = op
+                .child
+                .wait()
+                .with_context(|| format!("failed to wait for aborted operation {}", op.id))?;
+            self.append_operation_output(&op)?;
+            self.log_message(format!(
+                "INFO op_aborted id={} op={:?} status={}",
+                op.id,
+                op.op,
+                render_status(status),
+            ))?;
         }
+        Ok(())
     }
 
-    fn add_device(&mut self, device: &str) -> Result<()> {
-        let mountpoint = self.mountpoint_str()?.to_owned();
-        run_command(
-            &mut self.log,
-            "bcachefs",
-            &["device", "add", "-f", mountpoint.as_str(), device],
-        )
-    }
-
-    fn remove_device(&mut self, before: &Observation, device: &str) -> Result<()> {
-        let mountpoint = self.mountpoint_str()?.to_owned();
-        let dev_idx = before
-            .device_indices
-            .get(device)
-            .copied()
-            .with_context(|| format!("missing device index for removable member {device}"))?;
-        let dev_idx = dev_idx.to_string();
-        // `device remove` expects a fully evacuated member. Follow the documented
-        // userspace workflow so remove only fails when reconcile cannot move the
-        // remaining data/metadata elsewhere.
-        run_command(&mut self.log, "bcachefs", &["device", "evacuate", device])?;
-        run_command(
-            &mut self.log,
-            "bcachefs",
-            &["device", "remove", dev_idx.as_str(), mountpoint.as_str()],
-        )
-    }
-
-    fn resize_device(&mut self, device: &str, target_bytes: u64) -> Result<bool> {
-        let target = target_bytes.to_string();
-        let output = run_command_capture_allow_failure(
-            &mut self.log,
-            "bcachefs",
-            &["device", "resize", device, target.as_str()],
-        )?;
-        Ok(output.status.success())
+    fn append_operation_output(&mut self, op: &InflightOperation) -> Result<()> {
+        append_output_file(&mut self.log, op.id, "stdout", &op.stdout_path)?;
+        append_output_file(&mut self.log, op.id, "stderr", &op.stderr_path)?;
+        let _ = fs::remove_file(&op.stdout_path);
+        let _ = fs::remove_file(&op.stderr_path);
+        Ok(())
     }
 
     fn assert_expected_outcome(
@@ -440,35 +701,106 @@ impl Harness {
         } else {
             &expected.on_failure
         };
+
+        self.assert_expected_observation(operation, wanted, observed)
+    }
+
+    fn assert_expected_observation(
+        &self,
+        operation: &Operation,
+        expected: &ExpectedObservation,
+        observed: &Observation,
+    ) -> Result<()> {
         ensure!(
-            observed.mounted == wanted.mounted
-                && observed.active_member_devices == wanted.active_member_devices
-                && observed.device_sizes == wanted.device_sizes,
-            "unexpected observed state after {operation:?}: expected {wanted:?}, got {observed:?}",
+            observed.mounted == expected.mounted,
+            "unexpected mount state after {operation:?}: expected {}, got {}",
+            expected.mounted,
+            observed.mounted,
+        );
+
+        if let Some(active_member_devices) = &expected.active_member_devices {
+            ensure!(
+                &observed.active_member_devices == active_member_devices,
+                "unexpected active member set after {operation:?}: expected {:?}, got {:?}",
+                active_member_devices,
+                observed.active_member_devices,
+            );
+        }
+
+        for (device, expected_bytes) in &expected.required_device_sizes {
+            let observed_bytes = observed
+                .device_sizes
+                .get(device)
+                .copied()
+                .with_context(|| format!("missing device size for {device} after {operation:?}"))?;
+            ensure!(
+                observed_bytes == *expected_bytes,
+                "unexpected size for {device} after {operation:?}: expected {}, got {}",
+                expected_bytes,
+                observed_bytes,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn record_latest_resize_result(&mut self, operation: &Operation, success: bool) {
+        match operation {
+            Operation::AddDevice(device) | Operation::RemoveDevice(device) => {
+                self.latest_resize_results.remove(device);
+            }
+            Operation::ResizeDevice {
+                device,
+                target_bytes,
+            } => {
+                self.latest_resize_results.insert(
+                    device.clone(),
+                    LatestResizeResult {
+                        target_bytes: *target_bytes,
+                        completed_success: success,
+                    },
+                );
+            }
+        }
+    }
+
+    fn assert_live_properties(&self, observed: &Observation) -> Result<()> {
+        ensure!(
+            observed.mounted,
+            "continuous operations must leave the filesystem mounted",
+        );
+        ensure!(
+            !observed.active_member_devices.is_empty(),
+            "continuous operations must leave at least one active member device",
         );
         Ok(())
     }
 
-    fn assert_properties(&mut self, expected_live_topology: &Observation) -> Result<()> {
+    fn assert_quiescent_properties(&mut self, expected_live: &Observation) -> Result<()> {
         ensure!(
-            expected_live_topology.mounted,
-            "property assertions require a mounted filesystem",
+            expected_live.mounted,
+            "quiescent assertions require a mounted filesystem",
         );
 
+        /*
+         * Offline fsck and remount are only safe once the manager has drained
+         * all in-flight async operations. Doing this while a resize is still
+         * running would turn the assertion itself into interference.
+         */
         let mountpoint = self.mountpoint_str()?.to_owned();
         run_command(&mut self.log, "sync", &[])?;
         run_command(&mut self.log, "umount", &[mountpoint.as_str()])?;
 
         let mut fsck_args: Vec<&str> = vec!["fsck", "-n"];
         fsck_args.extend(
-            expected_live_topology
+            expected_live
                 .active_member_devices
                 .iter()
                 .map(String::as_str),
         );
         run_command(&mut self.log, "bcachefs", &fsck_args)?;
 
-        let joined = expected_live_topology.active_member_devices.join(":");
+        let joined = expected_live.active_member_devices.join(":");
         run_command(
             &mut self.log,
             "mount",
@@ -477,10 +809,40 @@ impl Harness {
 
         let remounted = self.snapshot_state("after_remount")?;
         ensure!(
-            remounted.mounted == expected_live_topology.mounted
-                && remounted.active_member_devices == expected_live_topology.active_member_devices,
-            "topology changed across fsck/remount: expected {expected_live_topology:?}, got {remounted:?}",
+            remounted.active_member_devices == expected_live.active_member_devices,
+            "state changed across fsck/remount: expected active members {:?}, got {:?}",
+            expected_live.active_member_devices,
+            remounted.active_member_devices,
         );
+        ensure!(
+            remounted.device_sizes == expected_live.device_sizes,
+            "state changed across fsck/remount: expected device sizes {:?}, got {:?}",
+            expected_live.device_sizes,
+            remounted.device_sizes,
+        );
+
+        for (device, latest) in &self.latest_resize_results {
+            let Some(&observed_bytes) = remounted.device_sizes.get(device) else {
+                continue;
+            };
+            if latest.completed_success {
+                ensure!(
+                    observed_bytes == latest.target_bytes,
+                    "latest successful resize for {} did not converge: expected {}, got {}",
+                    device,
+                    latest.target_bytes,
+                    observed_bytes,
+                );
+            } else {
+                ensure!(
+                    observed_bytes != latest.target_bytes,
+                    "latest failed resize for {} still converged to failed target {}",
+                    device,
+                    latest.target_bytes,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -528,32 +890,6 @@ impl Harness {
         })
     }
 
-    fn assert_model_matches_observation(&mut self, observed: &Observation) -> Result<()> {
-        ensure!(
-            observed.mounted,
-            "expected the test filesystem to be mounted, but it is not",
-        );
-        ensure!(
-            self.model.active_member_devices == observed.active_member_devices,
-            "generator model diverged from observed topology: model={:?}, observed={:?}",
-            self.model.active_member_devices,
-            observed.active_member_devices,
-        );
-        ensure!(
-            active_device_sizes(
-                &self.model.active_member_devices,
-                &self.model.current_device_bytes
-            ) == observed.device_sizes,
-            "generator model diverged from observed device sizes: model={:?}, observed={:?}",
-            active_device_sizes(
-                &self.model.active_member_devices,
-                &self.model.current_device_bytes
-            ),
-            observed.device_sizes,
-        );
-        Ok(())
-    }
-
     fn mountpoint_str(&self) -> Result<&str> {
         self.config.mountpoint.to_str().with_context(|| {
             format!(
@@ -573,144 +909,35 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::try_from(cli)?;
     initialize_log_file(&config.log_path)?;
-    run_proptest_cases(&config)
+    run_cases(&config)
 }
 
-fn run_proptest_cases(config: &Config) -> Result<()> {
-    let initial_model = Model::initial(config);
-    let strategy =
-        operation_sequence_strategy(config, initial_model.clone(), 1..=config.operations);
-    let mut runner = TestRunner::new(proptest_config(config.cases));
-    let case_index = Cell::new(0_u32);
+fn run_cases(config: &Config) -> Result<()> {
+    for case_index in 0..config.cases {
+        let mut harness = Harness::new(config)?;
+        let seed = config.seed.wrapping_add(case_index as u64);
 
-    let result = runner.run(
-        &strategy,
-        |(generated_initial_model, transitions, _seen_counter)| {
-            let current_case = case_index.get();
-            case_index.set(current_case + 1);
+        let prepare_result = harness.prepare_fresh_filesystem();
+        let case_result = prepare_result.and_then(|()| harness.run_case(case_index, seed));
+        let cleanup_result = harness.cleanup_mountpoint();
 
-            match run_generated_case(config, &generated_initial_model, &transitions, current_case) {
-                Ok(()) => Ok(()),
-                Err(err) => Err(TestCaseError::fail(format!("{err:#}"))),
+        match (case_result, cleanup_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(case_err), Ok(())) => {
+                harness.log_message(format!(
+                    "ERROR case_failed index={} error={:#}",
+                    case_index, case_err
+                ))?;
+                return Err(case_err);
             }
-        },
-    );
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(TestError::Fail(reason, value)) => {
-            append_failure_summary(&config.log_path, &reason.to_string(), &value)?;
-            bail!("proptest found a minimal failing case: {reason}; transitions={value:?}");
-        }
-        Err(TestError::Abort(reason)) => {
-            append_abort_summary(&config.log_path, &reason.to_string())?;
-            bail!("proptest aborted: {reason}");
-        }
-    }
-}
-
-fn run_generated_case(
-    config: &Config,
-    generated_initial_model: &Model,
-    transitions: &[Operation],
-    case_index: u32,
-) -> Result<()> {
-    let mut harness = Harness::new(config)?;
-    ensure!(
-        &harness.model == generated_initial_model,
-        "generated initial state diverged from the configured initial model",
-    );
-
-    let prepare_result = harness.prepare_fresh_filesystem();
-    let case_result = prepare_result.and_then(|()| harness.run_case(case_index, transitions));
-    let cleanup_result = harness.cleanup_mountpoint();
-
-    match (case_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(case_err), Ok(())) => Err(case_err),
-        (Ok(()), Err(cleanup_err)) => Err(cleanup_err),
-        (Err(case_err), Err(cleanup_err)) => {
-            Err(case_err.context(format!("case cleanup also failed: {cleanup_err:#}")))
-        }
-    }
-}
-
-fn operation_sequence_strategy(
-    config: &Config,
-    initial_model: Model,
-    size: impl Into<proptest::collection::SizeRange>,
-) -> Sequential<Model, Operation, BoxedStrategy<Model>, BoxedStrategy<Operation>> {
-    let config_like = ConfigLike {
-        device_physical_bytes: config.device_physical_bytes.clone(),
-        device_resize_targets: config.device_resize_targets.clone(),
-    };
-
-    Sequential::new(
-        size.into(),
-        move || Just(initial_model.clone()).boxed(),
-        |state, transition| state.supports(transition),
-        {
-            let config = config_like.clone();
-            move |state| operation_strategy(state, &config)
-        },
-        {
-            let config = config_like;
-            move |state, transition| {
-                state.apply_transition(&config.device_physical_bytes, transition)
-            }
-        },
-    )
-}
-
-fn operation_strategy(state: &Model, config: &ConfigLike) -> BoxedStrategy<Operation> {
-    let mut operations = Vec::new();
-
-    for device in &state.available_devices {
-        if state.supports(&Operation::AddDevice(device.clone())) {
-            operations.push(Operation::AddDevice(device.clone()));
-        }
-    }
-
-    for device in &state.active_member_devices {
-        if state.supports(&Operation::RemoveDevice(device.clone())) {
-            operations.push(Operation::RemoveDevice(device.clone()));
-        }
-    }
-
-    for device in &state.active_member_devices {
-        let Some(&current_bytes) = state.current_device_bytes.get(device) else {
-            continue;
-        };
-        let Some(targets) = config.device_resize_targets.get(device) else {
-            continue;
-        };
-
-        for &target_bytes in targets {
-            if current_bytes == target_bytes {
-                continue;
-            }
-            let op = Operation::ResizeDevice {
-                device: device.clone(),
-                target_bytes,
-            };
-            if state.supports(&op) {
-                operations.push(op);
+            (Ok(()), Err(cleanup_err)) => return Err(cleanup_err),
+            (Err(case_err), Err(cleanup_err)) => {
+                return Err(case_err.context(format!("case cleanup also failed: {cleanup_err:#}")));
             }
         }
     }
 
-    assert!(
-        !operations.is_empty(),
-        "state-machine reached a topology with no valid operations",
-    );
-
-    select(operations).boxed()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ConfigLike {
-    device_physical_bytes: BTreeMap<String, u64>,
-    device_resize_targets: BTreeMap<String, Vec<u64>>,
+    Ok(())
 }
 
 fn parse_active_member_devices(
@@ -822,20 +1049,6 @@ fn ensure_distinct_devices(devices: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn active_device_sizes(
-    active_devices: &[String],
-    current_device_bytes: &BTreeMap<String, u64>,
-) -> BTreeMap<String, u64> {
-    active_devices
-        .iter()
-        .filter_map(|device| {
-            current_device_bytes
-                .get(device)
-                .map(|bytes| (device.clone(), *bytes))
-        })
-        .collect()
-}
-
 fn query_device_size_bytes(device: &str) -> Result<u64> {
     let output = Command::new("blockdev")
         .args(["--getsize64", device])
@@ -874,7 +1087,6 @@ fn resize_candidate_target_bytes(physical_bytes: u64) -> Result<Vec<u64>> {
         target += STEP_BYTES;
     }
     targets.push(physical_bytes);
-
     Ok(targets)
 }
 
@@ -905,11 +1117,20 @@ fn format_device_sizes(
         .join(",")
 }
 
-fn proptest_config(cases: u32) -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    config.cases = cases;
-    config.failure_persistence = None;
-    config
+fn format_operations(operations: &[Operation]) -> String {
+    if operations.is_empty() {
+        return "-".to_string();
+    }
+
+    operations
+        .iter()
+        .map(|op| format!("{op:?}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
 fn initialize_log_file(path: &Path) -> Result<()> {
@@ -919,36 +1140,6 @@ fn initialize_log_file(path: &Path) -> Result<()> {
         .write(true)
         .open(path)
         .with_context(|| format!("failed to initialize log file {}", path.display()))?;
-    Ok(())
-}
-
-fn append_failure_summary(
-    path: &Path,
-    reason: &str,
-    value: &(
-        Model,
-        Vec<Operation>,
-        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    ),
-) -> Result<()> {
-    let mut log = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to append failure summary to {}", path.display()))?;
-    writeln!(log, "ERROR proptest_failure reason={reason}")
-        .context("failed to write proptest failure reason")?;
-    writeln!(log, "ERROR proptest_failure_value {value:?}")
-        .context("failed to write proptest failure value")?;
-    Ok(())
-}
-
-fn append_abort_summary(path: &Path, reason: &str) -> Result<()> {
-    let mut log = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to append abort summary to {}", path.display()))?;
-    writeln!(log, "ERROR proptest_abort reason={reason}")
-        .context("failed to write proptest abort reason")?;
     Ok(())
 }
 
@@ -975,7 +1166,11 @@ fn run_command(log: &mut File, program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn run_command_capture(log: &mut File, program: &str, args: &[&str]) -> Result<Output> {
+fn run_command_capture(
+    log: &mut File,
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output> {
     let output = run_command_capture_allow_failure(log, program, args)?;
 
     if !output.status.success() {
@@ -989,7 +1184,7 @@ fn run_command_capture_allow_failure(
     log: &mut File,
     program: &str,
     args: &[&str],
-) -> Result<Output> {
+) -> Result<std::process::Output> {
     writeln!(log, "CMD program={} args={}", program, args.join(" "))
         .context("failed to write command header to log")?;
 
@@ -1011,6 +1206,22 @@ fn run_command_capture_allow_failure(
     }
 
     Ok(output)
+}
+
+fn append_output_file(log: &mut File, op_id: u64, stream: &str, path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let contents = fs::read(path)
+        .with_context(|| format!("failed to read operation output {}", path.display()))?;
+
+    for line in String::from_utf8_lossy(&contents).lines() {
+        writeln!(log, "ASYNC_{}_{} {}", stream, op_id, line)
+            .with_context(|| format!("failed to append {} output", stream))?;
+    }
+
+    Ok(())
 }
 
 fn write_output(log: &mut File, stream: &str, bytes: &[u8]) -> Result<()> {
