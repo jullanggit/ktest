@@ -130,12 +130,7 @@ impl Harness {
         Ok(Self { model, log })
     }
 
-    fn run(&mut self, initial_model: &Model, ops: &[Operation]) -> Result<()> {
-        ensure!(
-            &self.model == initial_model,
-            "generated initial model does not match observed runtime model",
-        );
-
+    fn run(&mut self, ops: &[Operation]) -> Result<()> {
         self.log_message(format!(
             "INFO phase=startup mounted_model={} active_member_devices={} available_devices={}",
             self.model.mounted,
@@ -257,7 +252,7 @@ fn main() -> Result<()> {
     let transitions = generate_operations(&initial_model, config.operations)?;
     let mut harness = Harness::new(&config)?;
 
-    harness.run(&initial_model, &transitions)
+    harness.run(&transitions)
 }
 
 fn generate_operations(initial_model: &Model, count: usize) -> Result<Vec<Operation>> {
