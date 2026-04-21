@@ -113,16 +113,7 @@ impl Model {
                     && self.available_devices.contains(device)
             }
             Operation::RemoveDevice(device) => {
-                // A freshly prepared case starts with only the primary device.
-                // Removing that original member is not yet in the harness's
-                // clearly-should-succeed envelope: even without foreground IO,
-                // the filesystem may still have to evacuate data and metadata
-                // away from the seed device. Keep the first operation set to
-                // add/remove of non-seed members until the oracle can classify
-                // more subtle remove cases from live observations.
-                self.active_member_devices.len() > 1
-                    && self.active_member_devices.contains(device)
-                    && device != &self.available_devices[0]
+                self.active_member_devices.len() > 1 && self.active_member_devices.contains(device)
             }
         }
     }
@@ -232,7 +223,6 @@ impl Harness {
             ))?;
 
             self.execute_operation(op, &before)?;
-
             let after = self.snapshot_state("after_op")?;
             self.assert_expected_outcome(op, &expected, &after)?;
             self.assert_properties(&after)?;
@@ -297,6 +287,10 @@ impl Harness {
             .copied()
             .with_context(|| format!("missing device index for removable member {device}"))?;
         let dev_idx = dev_idx.to_string();
+        // `device remove` expects a fully evacuated member. Follow the documented
+        // userspace workflow so remove only fails when reconcile cannot move the
+        // remaining data/metadata elsewhere.
+        run_command(&mut self.log, "bcachefs", &["device", "evacuate", device])?;
         run_command(
             &mut self.log,
             "bcachefs",
@@ -529,28 +523,25 @@ fn parse_active_member_devices(
     let mut device_indices = BTreeMap::new();
 
     for line in usage_text.lines() {
-        if !line.contains("(device ") {
-            continue;
-        }
-
-        let dev_idx = line
-            .split_once("(device ")
-            .and_then(|(_, rest)| rest.split_once(')'))
-            .and_then(|(dev_idx, _)| dev_idx.parse::<u32>().ok())
-            .with_context(|| {
-                format!("failed to parse device index from fs usage output: {line}")
+        if line.contains("(device ") {
+            let dev_idx = line
+                .split_once("(device ")
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .and_then(|(dev_idx, _)| dev_idx.parse::<u32>().ok())
+                .with_context(|| {
+                    format!("failed to parse device index from fs usage output: {line}")
+                })?;
+            let (_, rest) = line.split_once(':').with_context(|| {
+                format!("failed to parse device line from fs usage output: {line}")
             })?;
-        let (_, rest) = line
-            .split_once(':')
-            .with_context(|| format!("failed to parse device line from fs usage output: {line}"))?;
-        let dev_name = rest
-            .split_whitespace()
-            .next()
-            .with_context(|| format!("failed to parse device name from fs usage output: {line}"))?;
+            let dev_name = rest.split_whitespace().next().with_context(|| {
+                format!("failed to parse device name from fs usage output: {line}")
+            })?;
 
-        let device = resolve_available_device(dev_name, available_devices);
-        device_indices.insert(device.clone(), dev_idx);
-        active_member_devices.push(device);
+            let device = resolve_available_device(dev_name, available_devices);
+            device_indices.insert(device.clone(), dev_idx);
+            active_member_devices.push(device);
+        }
     }
 
     ensure!(
@@ -659,6 +650,20 @@ fn run_command(log: &mut File, program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn run_command_capture(log: &mut File, program: &str, args: &[&str]) -> Result<Output> {
+    let output = run_command_capture_allow_failure(log, program, args)?;
+
+    if !output.status.success() {
+        bail!("command failed: {} {}", program, args.join(" "));
+    }
+
+    Ok(output)
+}
+
+fn run_command_capture_allow_failure(
+    log: &mut File,
+    program: &str,
+    args: &[&str],
+) -> Result<Output> {
     writeln!(log, "CMD program={} args={}", program, args.join(" "))
         .context("failed to write command header to log")?;
 
@@ -677,7 +682,6 @@ fn run_command_capture(log: &mut File, program: &str, args: &[&str]) -> Result<O
             render_status(output.status),
         )
         .context("failed to write command failure to log")?;
-        bail!("command failed: {} {}", program, args.join(" "));
     }
 
     Ok(output)
