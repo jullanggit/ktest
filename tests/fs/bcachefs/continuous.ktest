@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+. $(dirname $(readlink -e ${BASH_SOURCE[0]}))/bcachefs-test-libs.sh
+
+require-make continuous
+
+config-scratch-devs 2G
+
+test_basic_loop()
+{
+    local dev=${ktest_scratch_dev[0]}
+
+    set_watchdog 60
+
+    run_quiet "" bcachefs format -f "$dev"
+    mount -t bcachefs "$dev" /mnt
+
+    continuous-bcachefs-test				\
+	--device "$dev"					\
+	--log "$ktest_out/continuous-basic.log"		\
+	--mountpoint /mnt
+
+    umount /mnt
+
+    bcachefs fsck -ny "$dev"
+
+    mount -t bcachefs "$dev" /mnt
+    umount /mnt
+
+    bcachefs_test_end_checks "$dev"
+}
+
+main "$@"
