@@ -27,11 +27,11 @@ struct Cli {
     mountpoint: PathBuf,
 
     /// Number of operations to launch per case.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 20)]
     operations: usize,
 
     /// Number of fresh filesystem cases to execute.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 10)]
     cases: u32,
 
     /// Deterministic seed for operation scheduling.
