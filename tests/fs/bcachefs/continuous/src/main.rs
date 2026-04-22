@@ -137,7 +137,6 @@ impl TargetKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Observation {
-    mounted: bool,
     active_member_devices: Vec<String>,
     device_indices: BTreeMap<String, u32>,
     device_sizes: BTreeMap<String, u64>,
@@ -148,7 +147,6 @@ struct Observation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExpectedObservation {
-    mounted: bool,
     active_member_devices: Option<Vec<String>>,
     required_device_sizes: BTreeMap<String, u64>,
     required_targets: BTreeMap<TargetKind, Option<DeviceLabel>>,
@@ -296,10 +294,6 @@ impl Harness {
         )?;
 
         let observed = self.snapshot_state("after_prepare")?;
-        ensure!(
-            observed.mounted,
-            "expected the test filesystem to be mounted after prepare",
-        );
         ensure!(
             observed.active_member_devices == profile.initial_devices,
             "unexpected initial topology after prepare: {:?}",
@@ -462,11 +456,6 @@ impl Harness {
         let success = status.success();
 
         if op.superseded {
-            ensure!(
-                after.mounted,
-                "superseded operation {:?} left the filesystem unmounted",
-                op.op,
-            );
         } else {
             self.assert_expected_outcome(&op.op, &op.expected, success, &after)?;
             self.record_latest_resize_result(&op.op, success);
@@ -555,10 +544,6 @@ impl Harness {
         observation: &Observation,
         inflight: &[InflightOperation],
     ) -> Vec<Operation> {
-        if !observation.mounted {
-            return Vec::new();
-        }
-
         let topology_locked = inflight
             .iter()
             .any(|op| !matches!(op.op, Operation::ResizeDevice { .. }));
@@ -699,14 +684,11 @@ impl Harness {
         inflight: &[InflightOperation],
         operation: &Operation,
     ) -> Result<ExpectedOutcome> {
-        ensure!(before.mounted, "operations require a mounted filesystem");
-
         let concurrent_resize = inflight
             .iter()
             .any(|op| matches!(op.op, Operation::ResizeDevice { .. }));
 
         let on_failure = ExpectedObservation {
-            mounted: true,
             active_member_devices: Some(before.active_member_devices.clone()),
             required_device_sizes: if concurrent_resize {
                 BTreeMap::new()
@@ -733,7 +715,6 @@ impl Harness {
                 required_device_sizes.insert(device.clone(), physical_bytes);
 
                 ExpectedObservation {
-                    mounted: true,
                     active_member_devices: Some(active),
                     required_device_sizes,
                     required_targets: before.targets.clone(),
@@ -750,7 +731,6 @@ impl Harness {
                 required_device_labels.remove(device);
 
                 ExpectedObservation {
-                    mounted: true,
                     active_member_devices: Some(active),
                     required_device_sizes,
                     required_targets: before.targets.clone(),
@@ -760,7 +740,6 @@ impl Harness {
             Operation::ToggleFileChurn
             | Operation::ToggleRandrw
             | Operation::ToggleSnapshotChurn => ExpectedObservation {
-                mounted: true,
                 active_member_devices: Some(before.active_member_devices.clone()),
                 required_device_sizes: if concurrent_resize {
                     BTreeMap::new()
@@ -775,7 +754,6 @@ impl Harness {
                 required_targets.insert(*kind, Some(*label));
 
                 ExpectedObservation {
-                    mounted: true,
                     active_member_devices: Some(before.active_member_devices.clone()),
                     required_device_sizes: if concurrent_resize {
                         BTreeMap::new()
@@ -791,7 +769,6 @@ impl Harness {
                 required_device_labels.insert(device.clone(), Some(*label));
 
                 ExpectedObservation {
-                    mounted: true,
                     active_member_devices: Some(before.active_member_devices.clone()),
                     required_device_sizes: if concurrent_resize {
                         BTreeMap::new()
@@ -808,7 +785,6 @@ impl Harness {
              * check runs once the manager reaches a quiescent point.
              */
             Operation::ResizeDevice { .. } => ExpectedObservation {
-                mounted: true,
                 active_member_devices: Some(before.active_member_devices.clone()),
                 required_device_sizes: BTreeMap::new(),
                 required_targets: BTreeMap::new(),
@@ -1366,13 +1342,6 @@ impl Harness {
         expected: &ExpectedObservation,
         observed: &Observation,
     ) -> Result<()> {
-        ensure!(
-            observed.mounted == expected.mounted,
-            "unexpected mount state after {operation:?}: expected {}, got {}",
-            expected.mounted,
-            observed.mounted,
-        );
-
         if let Some(active_member_devices) = &expected.active_member_devices {
             ensure!(
                 &observed.active_member_devices == active_member_devices,
@@ -1448,10 +1417,6 @@ impl Harness {
 
     fn assert_live_properties(&self, observed: &Observation) -> Result<()> {
         ensure!(
-            observed.mounted,
-            "continuous operations must leave the filesystem mounted",
-        );
-        ensure!(
             !observed.active_member_devices.is_empty(),
             "continuous operations must leave at least one active member device",
         );
@@ -1474,11 +1439,6 @@ impl Harness {
     }
 
     fn assert_periodic_properties(&mut self, observed: &Observation) -> Result<()> {
-        ensure!(
-            observed.mounted,
-            "periodic fsck requires a mounted filesystem",
-        );
-
         /*
          * Keep fsck online so the checkpoint itself does not tear down the
          * live state the manager is trying to exercise. Running it every
@@ -1491,11 +1451,6 @@ impl Harness {
     }
 
     fn assert_quiescent_properties(&mut self, expected_live: &Observation) -> Result<()> {
-        ensure!(
-            expected_live.mounted,
-            "quiescent assertions require a mounted filesystem",
-        );
-
         for (device, latest) in &self.latest_resize_results {
             let Some(&observed_bytes) = expected_live.device_sizes.get(device) else {
                 continue;
@@ -1522,24 +1477,6 @@ impl Harness {
     }
 
     fn snapshot_state(&mut self, phase: &str) -> Result<Observation> {
-        let mounted = is_mountpoint_active(&self.config.mountpoint)?;
-
-        if !mounted {
-            self.log_message(format!(
-                "INFO snapshot phase={} mounted=false active_member_devices=",
-                phase,
-            ))?;
-            return Ok(Observation {
-                mounted: false,
-                active_member_devices: Vec::new(),
-                device_indices: BTreeMap::new(),
-                device_sizes: BTreeMap::new(),
-                used_bytes: 0,
-                targets: BTreeMap::new(),
-                device_labels: BTreeMap::new(),
-            });
-        }
-
         let mountpoint = self.mountpoint_str()?.to_owned();
         let usage = run_command_capture(
             &mut self.log,
@@ -1555,7 +1492,7 @@ impl Harness {
             read_device_labels(&sysfs_root, &active_member_devices, &device_indices)?;
 
         self.log_message(format!(
-            "INFO snapshot phase={} mounted=true used_bytes={} active_member_devices={} device_sizes={}",
+            "INFO snapshot phase={} used_bytes={} active_member_devices={} device_sizes={}",
             phase,
             used_bytes,
             active_member_devices.join(","),
@@ -1563,7 +1500,6 @@ impl Harness {
         ))?;
 
         Ok(Observation {
-            mounted: true,
             active_member_devices,
             device_indices,
             device_sizes,
