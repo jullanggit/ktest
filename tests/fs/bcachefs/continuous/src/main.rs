@@ -111,7 +111,7 @@ struct FormatProfile {
     replicas: usize,
     erasure_code: bool,
     encrypted: bool,
-    compression: Option<&'static str>,
+    compression: bool,
     initial_devices: Vec<String>,
     device_bucket_sizes: BTreeMap<String, &'static str>,
 }
@@ -1774,11 +1774,7 @@ impl FormatProfile {
         let erasure_code =
             replicas >= 2 && config.available_devices.len() >= 3 && rng.gen_bool(0.5);
         let encrypted = rng.gen_bool(0.5);
-        let compression = if rng.gen_bool(0.5) {
-            Some("zstd:1")
-        } else {
-            None
-        };
+        let compression = rng.gen_bool(0.5);
 
         let initial_member_count = if erasure_code {
             replicas.max(3)
@@ -1837,8 +1833,8 @@ fn format_args_for_profile(profile: &FormatProfile) -> Vec<String> {
         args.push("--no_passphrase".to_string());
     }
 
-    if let Some(compression) = profile.compression {
-        args.push(format!("--compression={compression}"));
+    if profile.compression {
+        args.push("--compression=zstd:1".to_string());
     }
 
     for device in &profile.initial_devices {
