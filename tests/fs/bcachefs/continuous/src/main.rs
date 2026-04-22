@@ -86,23 +86,26 @@ struct Config {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DeviceLabel {
-    Foreground,
-    Background,
+    A,
+    B,
+    C,
 }
 
 impl DeviceLabel {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Foreground => "foreground",
-            Self::Background => "background",
+            Self::A => "a",
+            Self::B => "b",
+            Self::C => "c",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
         match text.trim() {
             "" => None,
-            "foreground" => Some(Self::Foreground),
-            "background" => Some(Self::Background),
+            "a" => Some(Self::A),
+            "b" => Some(Self::B),
+            "c" => Some(Self::C),
             _ => None,
         }
     }
@@ -140,6 +143,7 @@ struct Observation {
     active_member_devices: Vec<String>,
     device_indices: BTreeMap<String, u32>,
     device_sizes: BTreeMap<String, u64>,
+    device_bucket_sizes: BTreeMap<String, u64>,
     used_bytes: u64,
     targets: BTreeMap<TargetKind, Option<DeviceLabel>>,
     device_labels: BTreeMap<String, Option<DeviceLabel>>,
@@ -624,7 +628,7 @@ impl Harness {
             }
 
             for device in &observation.active_member_devices {
-                for label in [DeviceLabel::Foreground, DeviceLabel::Background] {
+                for label in [DeviceLabel::A, DeviceLabel::B, DeviceLabel::C] {
                     let current = observation.device_labels.get(device).copied().flatten();
                     if current == Some(label) {
                         continue;
@@ -648,12 +652,19 @@ impl Harness {
                 let Some(&current_bytes) = observation.device_sizes.get(device) else {
                     continue;
                 };
+                let Some(&bucket_size_bytes) = observation.device_bucket_sizes.get(device) else {
+                    continue;
+                };
                 let Some(targets) = self.config.device_resize_targets.get(device) else {
                     continue;
                 };
+                let min_target_bytes = minimum_resize_target_bytes(bucket_size_bytes);
 
                 for &target_bytes in targets {
                     if target_bytes == current_bytes {
+                        continue;
+                    }
+                    if target_bytes < min_target_bytes {
                         continue;
                     }
                     if inflight.iter().any(|op| {
@@ -800,8 +811,22 @@ impl Harness {
             | Operation::ToggleSnapshotChurn
             | Operation::SetTarget { .. }
             | Operation::SetDeviceLabel { .. } => Some(true),
-            Operation::ResizeDevice { target_bytes, .. } => {
-                classify_resize_outcome(before.used_bytes, *target_bytes)
+            Operation::ResizeDevice {
+                device,
+                target_bytes,
+            } => {
+                let min_target_bytes = before
+                    .device_bucket_sizes
+                    .get(device)
+                    .copied()
+                    .map(minimum_resize_target_bytes)
+                    .with_context(|| format!("missing bucket size for {device}"))?;
+
+                if *target_bytes < min_target_bytes {
+                    Some(false)
+                } else {
+                    classify_resize_outcome(before.used_bytes, *target_bytes)
+                }
             }
         };
 
@@ -1484,7 +1509,7 @@ impl Harness {
             &["fs", "usage", "--all", mountpoint.as_str()],
         )?;
         let usage_stdout = String::from_utf8_lossy(&usage.stdout);
-        let (active_member_devices, device_indices, device_sizes, used_bytes) =
+        let (active_member_devices, device_indices, device_sizes, device_bucket_sizes, used_bytes) =
             parse_active_member_devices(&usage_stdout, &self.config.available_devices)?;
         let sysfs_root = find_single_bcachefs_sysfs_dir()?;
         let targets = read_fs_targets(&sysfs_root)?;
@@ -1503,6 +1528,7 @@ impl Harness {
             active_member_devices,
             device_indices,
             device_sizes,
+            device_bucket_sizes,
             used_bytes,
             targets,
             device_labels,
@@ -1566,11 +1592,13 @@ fn parse_active_member_devices(
     Vec<String>,
     BTreeMap<String, u32>,
     BTreeMap<String, u64>,
+    BTreeMap<String, u64>,
     u64,
 )> {
     let mut active_member_devices = Vec::new();
     let mut device_indices = BTreeMap::new();
     let mut device_sizes = BTreeMap::new();
+    let mut device_bucket_sizes = BTreeMap::new();
     let mut used_bytes = None;
     let mut current_device = None;
 
@@ -1619,6 +1647,24 @@ fn parse_active_member_devices(
                     format!("failed to parse device capacity bytes from fs usage output: {line}")
                 })?;
             device_sizes.insert(device.clone(), size_bytes);
+            continue;
+        }
+
+        if let Some(rest) = line.trim_start().strip_prefix("bucket size:") {
+            let device = current_device
+                .as_ref()
+                .with_context(|| format!("saw bucket size line before device header: {line}"))?;
+            let bucket_size_bytes = rest
+                .split_whitespace()
+                .next()
+                .with_context(|| {
+                    format!("failed to parse device bucket size from fs usage output: {line}")
+                })?
+                .parse::<u64>()
+                .with_context(|| {
+                    format!("failed to parse device bucket size bytes from fs usage output: {line}")
+                })?;
+            device_bucket_sizes.insert(device.clone(), bucket_size_bytes);
         }
     }
 
@@ -1633,11 +1679,16 @@ fn parse_active_member_devices(
         device_sizes.len() == active_member_devices.len(),
         "fs usage did not report capacities for every active device: devices={active_member_devices:?} sizes={device_sizes:?}",
     );
+    ensure!(
+        device_bucket_sizes.len() == active_member_devices.len(),
+        "fs usage did not report bucket sizes for every active device: devices={active_member_devices:?} bucket_sizes={device_bucket_sizes:?}",
+    );
     sort_devices(&mut active_member_devices);
     Ok((
         active_member_devices,
         device_indices,
         device_sizes,
+        device_bucket_sizes,
         used_bytes,
     ))
 }
@@ -1867,6 +1918,12 @@ fn resize_candidate_target_bytes(physical_bytes: u64) -> Result<Vec<u64>> {
     }
     targets.push(physical_bytes);
     Ok(targets)
+}
+
+fn minimum_resize_target_bytes(bucket_size_bytes: u64) -> u64 {
+    const BCH_MIN_NR_NBUCKETS: u64 = 1 << 9;
+
+    bucket_size_bytes * BCH_MIN_NR_NBUCKETS
 }
 
 fn active_device_sizes(
