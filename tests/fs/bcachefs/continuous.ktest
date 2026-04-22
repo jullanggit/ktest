@@ -24,7 +24,8 @@ test_basic_loop()
 	"${args[@]}"					\
 	--log "$log"					\
 	--mountpoint /mnt				\
-	--cases 4; then
+	--operations 50 \
+	--cases 10; then
 	echo ":: continuous harness log"
 	cat "$log"
 	return 1
