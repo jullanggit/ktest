@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const FSCK_INTERVAL_ACTIONS: usize = 10;
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -195,6 +197,8 @@ struct Harness {
     log: File,
     latest_resize_results: BTreeMap<String, LatestResizeResult>,
     current_profile: Option<FormatProfile>,
+    completed_actions: usize,
+    next_fsck_after_action: usize,
     file_churn: Option<BackgroundWorker>,
     randrw: Option<BackgroundWorker>,
     snapshot_churn: Option<BackgroundWorker>,
@@ -255,6 +259,8 @@ impl Harness {
             log,
             latest_resize_results: BTreeMap::new(),
             current_profile: None,
+            completed_actions: 0,
+            next_fsck_after_action: FSCK_INTERVAL_ACTIONS,
             file_churn: None,
             randrw: None,
             snapshot_churn: None,
@@ -321,6 +327,8 @@ impl Harness {
     }
 
     fn run_case(&mut self, case_index: u32, seed: u64) -> Result<()> {
+        self.completed_actions = 0;
+        self.next_fsck_after_action = FSCK_INTERVAL_ACTIONS;
         self.log_message(format!(
             "INFO case_start index={} seed={} operations={} max_inflight={} spawn_interval_ms={}",
             case_index,
@@ -386,6 +394,7 @@ impl Harness {
             self.stop_workers(false)?;
             let observed = self.snapshot_state("after_stop_workers")?;
             self.assert_live_properties(&observed)?;
+            self.assert_periodic_properties(&observed)?;
             self.assert_quiescent_properties(&observed)?;
 
             Ok(())
@@ -464,6 +473,7 @@ impl Harness {
         }
 
         self.assert_live_properties(&after)?;
+        self.record_action_and_maybe_fsck(&after)?;
         if quiescent && !self.has_active_workers() {
             self.assert_quiescent_properties(&after)?;
         }
@@ -521,6 +531,7 @@ impl Harness {
         let after = self.snapshot_state("after_immediate_op")?;
         self.assert_expected_outcome(op, &expected, true, &after)?;
         self.assert_live_properties(&after)?;
+        self.record_action_and_maybe_fsck(&after)?;
         if inflight.is_empty() && !self.has_active_workers() {
             self.assert_quiescent_properties(&after)?;
         }
@@ -1447,53 +1458,46 @@ impl Harness {
         Ok(())
     }
 
+    fn record_action_and_maybe_fsck(&mut self, observed: &Observation) -> Result<()> {
+        self.completed_actions += 1;
+        if self.completed_actions < self.next_fsck_after_action {
+            return Ok(());
+        }
+
+        self.log_message(format!(
+            "INFO periodic_fsck trigger_action={} interval_actions={}",
+            self.completed_actions, FSCK_INTERVAL_ACTIONS,
+        ))?;
+        self.assert_periodic_properties(observed)?;
+        self.next_fsck_after_action += FSCK_INTERVAL_ACTIONS;
+        Ok(())
+    }
+
+    fn assert_periodic_properties(&mut self, observed: &Observation) -> Result<()> {
+        ensure!(
+            observed.mounted,
+            "periodic fsck requires a mounted filesystem",
+        );
+
+        /*
+         * Keep fsck online so the checkpoint itself does not tear down the
+         * live state the manager is trying to exercise. Running it every
+         * fixed number of completed operations also makes the cadence easy to
+         * reason about when concurrent async operations overlap.
+         */
+        let mut fsck_args: Vec<&str> = vec!["fsck", "-n"];
+        fsck_args.extend(observed.active_member_devices.iter().map(String::as_str));
+        run_command(&mut self.log, "bcachefs", &fsck_args)
+    }
+
     fn assert_quiescent_properties(&mut self, expected_live: &Observation) -> Result<()> {
         ensure!(
             expected_live.mounted,
             "quiescent assertions require a mounted filesystem",
         );
 
-        /*
-         * Offline fsck and remount are only safe once the manager has drained
-         * all in-flight async operations. Doing this while a resize is still
-         * running would turn the assertion itself into interference.
-         */
-        let mountpoint = self.mountpoint_str()?.to_owned();
-        run_command(&mut self.log, "sync", &[])?;
-        run_command(&mut self.log, "umount", &[mountpoint.as_str()])?;
-
-        let mut fsck_args: Vec<&str> = vec!["fsck", "-n"];
-        fsck_args.extend(
-            expected_live
-                .active_member_devices
-                .iter()
-                .map(String::as_str),
-        );
-        run_command(&mut self.log, "bcachefs", &fsck_args)?;
-
-        let joined = expected_live.active_member_devices.join(":");
-        run_command(
-            &mut self.log,
-            "mount",
-            &["-t", "bcachefs", joined.as_str(), mountpoint.as_str()],
-        )?;
-
-        let remounted = self.snapshot_state("after_remount")?;
-        ensure!(
-            remounted.active_member_devices == expected_live.active_member_devices,
-            "state changed across fsck/remount: expected active members {:?}, got {:?}",
-            expected_live.active_member_devices,
-            remounted.active_member_devices,
-        );
-        ensure!(
-            remounted.device_sizes == expected_live.device_sizes,
-            "state changed across fsck/remount: expected device sizes {:?}, got {:?}",
-            expected_live.device_sizes,
-            remounted.device_sizes,
-        );
-
         for (device, latest) in &self.latest_resize_results {
-            let Some(&observed_bytes) = remounted.device_sizes.get(device) else {
+            let Some(&observed_bytes) = expected_live.device_sizes.get(device) else {
                 continue;
             };
             if latest.completed_success {
@@ -1750,8 +1754,23 @@ fn read_device_labels(
             .copied()
             .with_context(|| format!("missing device index for {}", device))?;
         let path = sysfs_root.join(format!("dev-{dev_idx}/label"));
-        let value = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read device label {}", path.display()))?;
+        let value = match fs::read_to_string(&path) {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                /*
+                 * Topology changes can race observation: `fs usage` may still
+                 * report a member while its per-device sysfs directory is being
+                 * torn down. Treat a disappearing label file as "currently no
+                 * observable label" instead of aborting the whole case.
+                 */
+                labels.insert(device.clone(), None);
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read device label {}", path.display()));
+            }
+        };
         labels.insert(device.clone(), DeviceLabel::parse(&value));
     }
 
