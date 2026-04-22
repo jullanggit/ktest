@@ -201,6 +201,7 @@ struct Harness {
     current_profile: Option<FormatProfile>,
     completed_actions: usize,
     next_fsck_after_action: usize,
+    periodic_fsck_due: bool,
     file_churn: Option<BackgroundWorker>,
     randrw: Option<BackgroundWorker>,
     snapshot_churn: Option<BackgroundWorker>,
@@ -263,6 +264,7 @@ impl Harness {
             current_profile: None,
             completed_actions: 0,
             next_fsck_after_action: FSCK_INTERVAL_ACTIONS,
+            periodic_fsck_due: false,
             file_churn: None,
             randrw: None,
             snapshot_churn: None,
@@ -327,6 +329,7 @@ impl Harness {
     fn run_case(&mut self, case_index: u32, seed: u64) -> Result<()> {
         self.completed_actions = 0;
         self.next_fsck_after_action = FSCK_INTERVAL_ACTIONS;
+        self.periodic_fsck_due = false;
         self.log_message(format!(
             "INFO case_start index={} seed={} operations={} max_inflight={} spawn_interval_ms={}",
             case_index,
@@ -392,7 +395,7 @@ impl Harness {
             self.stop_workers(false)?;
             let observed = self.snapshot_state("after_stop_workers")?;
             self.assert_live_properties(&observed)?;
-            self.assert_periodic_properties(&observed)?;
+            self.run_due_periodic_fsck(&observed)?;
             self.assert_quiescent_properties(&observed)?;
 
             Ok(())
@@ -466,7 +469,10 @@ impl Harness {
         }
 
         self.assert_live_properties(&after)?;
-        self.record_action_and_maybe_fsck(&after)?;
+        self.record_action()?;
+        if quiescent && !self.has_active_workers() {
+            self.run_due_periodic_fsck(&after)?;
+        }
         if quiescent && !self.has_active_workers() {
             self.assert_quiescent_properties(&after)?;
         }
@@ -524,7 +530,10 @@ impl Harness {
         let after = self.snapshot_state("after_immediate_op")?;
         self.assert_expected_outcome(op, &expected, true, &after)?;
         self.assert_live_properties(&after)?;
-        self.record_action_and_maybe_fsck(&after)?;
+        self.record_action()?;
+        if inflight.is_empty() && !self.has_active_workers() {
+            self.run_due_periodic_fsck(&after)?;
+        }
         if inflight.is_empty() && !self.has_active_workers() {
             self.assert_quiescent_properties(&after)?;
         }
@@ -658,6 +667,9 @@ impl Harness {
                 let Some(targets) = self.config.device_resize_targets.get(device) else {
                     continue;
                 };
+                let Some(&physical_bytes) = self.config.device_physical_bytes.get(device) else {
+                    continue;
+                };
                 let min_target_bytes = minimum_resize_target_bytes(bucket_size_bytes);
 
                 for &target_bytes in targets {
@@ -678,6 +690,40 @@ impl Harness {
                     }) {
                         continue;
                     }
+                    operations.push(Operation::ResizeDevice {
+                        device: device.clone(),
+                        target_bytes,
+                    });
+                }
+
+                /*
+                 * Keep a small amount of obviously-invalid resize coverage in
+                 * the mix so the harness keeps asserting clear failure cases
+                 * too, but do not weight them heavily enough to crowd out the
+                 * more interesting legal resize surface.
+                 */
+                for target_bytes in [
+                    invalid_small_resize_target_bytes(min_target_bytes, bucket_size_bytes),
+                    invalid_large_resize_target_bytes(physical_bytes, bucket_size_bytes),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if target_bytes == current_bytes {
+                        continue;
+                    }
+                    if inflight.iter().any(|op| {
+                        matches!(
+                            op.op,
+                            Operation::ResizeDevice {
+                                device: ref inflight_device,
+                                target_bytes: inflight_target,
+                            } if inflight_device == device && inflight_target == target_bytes
+                        )
+                    }) {
+                        continue;
+                    }
+
                     operations.push(Operation::ResizeDevice {
                         device: device.clone(),
                         target_bytes,
@@ -805,12 +851,21 @@ impl Harness {
 
         let require_success = match operation {
             Operation::AddDevice(_)
-            | Operation::RemoveDevice(_)
             | Operation::ToggleFileChurn
             | Operation::ToggleRandrw
             | Operation::ToggleSnapshotChurn
             | Operation::SetTarget { .. }
             | Operation::SetDeviceLabel { .. } => Some(true),
+            Operation::RemoveDevice(_) => {
+                if self.has_active_workers()
+                    || before.targets.values().any(|label| label.is_some())
+                    || before.device_labels.values().any(|label| label.is_some())
+                {
+                    None
+                } else {
+                    Some(true)
+                }
+            }
             Operation::ResizeDevice {
                 device,
                 target_bytes,
@@ -825,9 +880,30 @@ impl Harness {
                 if *target_bytes < min_target_bytes {
                     Some(false)
                 } else {
-                    classify_resize_outcome(before.used_bytes, *target_bytes)
+                    let physical_bytes = self
+                        .config
+                        .device_physical_bytes
+                        .get(device)
+                        .copied()
+                        .with_context(|| format!("missing physical size for {device}"))?;
+
+                    if *target_bytes > physical_bytes {
+                        Some(false)
+                    } else {
+                        classify_resize_outcome(before.used_bytes, *target_bytes)
+                    }
                 }
             }
+        };
+
+        let on_failure = match operation {
+            Operation::RemoveDevice(_) if require_success.is_none() => ExpectedObservation {
+                active_member_devices: None,
+                required_device_sizes: BTreeMap::new(),
+                required_targets: BTreeMap::new(),
+                required_device_labels: BTreeMap::new(),
+            },
+            _ => on_failure,
         };
 
         Ok(ExpectedOutcome {
@@ -1448,18 +1524,32 @@ impl Harness {
         Ok(())
     }
 
-    fn record_action_and_maybe_fsck(&mut self, observed: &Observation) -> Result<()> {
+    fn record_action(&mut self) -> Result<()> {
         self.completed_actions += 1;
         if self.completed_actions < self.next_fsck_after_action {
             return Ok(());
         }
 
         self.log_message(format!(
-            "INFO periodic_fsck trigger_action={} interval_actions={}",
+            "INFO periodic_fsck_due trigger_action={} interval_actions={}",
             self.completed_actions, FSCK_INTERVAL_ACTIONS,
         ))?;
-        self.assert_periodic_properties(observed)?;
+        self.periodic_fsck_due = true;
         self.next_fsck_after_action += FSCK_INTERVAL_ACTIONS;
+        Ok(())
+    }
+
+    fn run_due_periodic_fsck(&mut self, observed: &Observation) -> Result<()> {
+        if !self.periodic_fsck_due {
+            return Ok(());
+        }
+
+        self.log_message(format!(
+            "INFO periodic_fsck_run completed_actions={}",
+            self.completed_actions,
+        ))?;
+        self.assert_periodic_properties(observed)?;
+        self.periodic_fsck_due = false;
         Ok(())
     }
 
@@ -1924,6 +2014,14 @@ fn minimum_resize_target_bytes(bucket_size_bytes: u64) -> u64 {
     const BCH_MIN_NR_NBUCKETS: u64 = 1 << 9;
 
     bucket_size_bytes * BCH_MIN_NR_NBUCKETS
+}
+
+fn invalid_small_resize_target_bytes(min_target_bytes: u64, bucket_size_bytes: u64) -> Option<u64> {
+    min_target_bytes.checked_sub(bucket_size_bytes)
+}
+
+fn invalid_large_resize_target_bytes(physical_bytes: u64, bucket_size_bytes: u64) -> Option<u64> {
+    physical_bytes.checked_add(bucket_size_bytes)
 }
 
 fn active_device_sizes(
