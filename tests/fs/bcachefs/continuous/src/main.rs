@@ -1560,7 +1560,7 @@ impl Harness {
          * fixed number of completed operations also makes the cadence easy to
          * reason about when concurrent async operations overlap.
          */
-        let mut fsck_args: Vec<&str> = vec!["fsck", "-n"];
+        let mut fsck_args: Vec<&str> = vec!["fsck", "-n", "-r"];
         fsck_args.extend(observed.active_member_devices.iter().map(String::as_str));
         run_command(&mut self.log, "bcachefs", &fsck_args)
     }
