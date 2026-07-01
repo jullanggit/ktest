@@ -2,7 +2,9 @@
   description = "Flake for ktest kernel builds";
 
   inputs = {
-    nixpkgs.url = github:NixOS/nixpkgs;
+    host.url = "git+file:///etc/nixos";
+
+    nixpkgs.follows = "host/nixpkgs";
     utils.url = "github:numtide/flake-utils";
     src.url = "https://evilpiepirate.org/git/bcachefs.git";
     src.flake = false;
@@ -12,7 +14,7 @@
 
   outputs = { self, utils, src,
               buildRoot,
-              nixpkgs }:
+              nixpkgs, ... }:
 
     utils.lib.eachDefaultSystem (system:
       let
