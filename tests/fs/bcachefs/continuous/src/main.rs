@@ -32,10 +32,6 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     operations: usize,
 
-    /// Number of fresh filesystem cases to execute.
-    #[arg(long, default_value_t = 10)]
-    cases: u32,
-
     /// Deterministic seed for operation scheduling.
     #[arg(long, default_value_t = 1)]
     seed: u64,
@@ -78,7 +74,6 @@ struct Config {
     log_path: PathBuf,
     mountpoint: PathBuf,
     operations: usize,
-    cases: u32,
     seed: u64,
     max_inflight: usize,
     spawn_interval_ms: u64,
@@ -220,7 +215,6 @@ impl TryFrom<Cli> for Config {
             "at least two --device entries are required for add/remove testing",
         );
         ensure!(cli.operations > 0, "--operations must be at least 1");
-        ensure!(cli.cases > 0, "--cases must be at least 1");
         ensure!(cli.max_inflight > 0, "--max-inflight must be at least 1");
         ensure_distinct_devices(&cli.available_devices)?;
 
@@ -241,7 +235,6 @@ impl TryFrom<Cli> for Config {
             log_path: cli.log,
             mountpoint: cli.mountpoint,
             operations: cli.operations,
-            cases: cli.cases,
             seed: cli.seed,
             max_inflight: cli.max_inflight,
             spawn_interval_ms: cli.spawn_interval_ms,
@@ -1644,35 +1637,31 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::try_from(cli)?;
     initialize_log_file(&config.log_path)?;
-    run_cases(&config)
+    run_case(&config, 0)
 }
 
-fn run_cases(config: &Config) -> Result<()> {
-    for case_index in 0..config.cases {
-        let mut harness = Harness::new(config)?;
-        let seed = config.seed.wrapping_add(case_index as u64);
+fn run_case(config: &Config, case_index: u64) -> Result<()> {
+    let mut harness = Harness::new(config)?;
+    let seed = config.seed.wrapping_add(case_index);
 
-        let prepare_result = harness.prepare_fresh_filesystem(seed);
-        let case_result = prepare_result.and_then(|()| harness.run_case(case_index, seed));
-        let cleanup_result = harness.cleanup_mountpoint();
+    let prepare_result = harness.prepare_fresh_filesystem(seed);
+    let case_result = prepare_result.and_then(|()| harness.run_case(case_index as u32, seed));
+    let cleanup_result = harness.cleanup_mountpoint();
 
-        match (case_result, cleanup_result) {
-            (Ok(()), Ok(())) => {}
-            (Err(case_err), Ok(())) => {
-                harness.log_message(format!(
-                    "ERROR case_failed index={} error={:#}",
-                    case_index, case_err
-                ))?;
-                return Err(case_err);
-            }
-            (Ok(()), Err(cleanup_err)) => return Err(cleanup_err),
-            (Err(case_err), Err(cleanup_err)) => {
-                return Err(case_err.context(format!("case cleanup also failed: {cleanup_err:#}")));
-            }
+    match (case_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(case_err), Ok(())) => {
+            harness.log_message(format!(
+                "ERROR case_failed index={} error={:#}",
+                case_index, case_err
+            ))?;
+            Err(case_err)
+        }
+        (Ok(()), Err(cleanup_err)) => Err(cleanup_err),
+        (Err(case_err), Err(cleanup_err)) => {
+            Err(case_err.context(format!("case cleanup also failed: {cleanup_err:#}")))
         }
     }
-
-    Ok(())
 }
 
 fn parse_active_member_devices(
