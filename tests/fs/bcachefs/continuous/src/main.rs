@@ -126,9 +126,11 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
         .map(|info| info.bucket_size)
         .sum::<usize>()
         * 512;
-    let max_num_files = (device_infos.values().map(|info| info.size).sum::<usize>()
-        - reserved_space)
-        / min_bucket_size;
+
+    let mut device_fs_sizes = device_infos
+        .iter()
+        .map(|(device, info)| (device.clone(), info.size))
+        .collect::<HashMap<_, _>>();
 
     let mut files = Vec::new();
 
@@ -139,10 +141,15 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
         let device = &cli.devices[rng.gen_range(0..cli.devices.len())];
         let device_size = device_infos[device].size;
 
-        let target_size = rng.gen_range(0..((1.08 * device_size as f64) as usize));
+        let target_size = rng.gen_range(0..((1.08 * device_size as f64) as usize)); // TODO: actually use buckets here as that is the atomic space unit used
 
         // expensive operation
         if round % 10 == 0 {
+            let max_num_files = (0.95 // don't over-fill fs - causes deadlocks
+                * (device_fs_sizes.values().sum::<usize>() - reserved_space) as f64)
+                as usize
+                / min_bucket_size;
+
             num_files = rng.gen_range(0..max_num_files);
             make_num_files(
                 num_files,
@@ -155,10 +162,10 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
 
         let device_reserved_space = 512 * device_infos[device].bucket_size;
         let target_fs_size = target_size
-            + device_infos
+            + device_fs_sizes
                 .iter()
                 .filter(|(map_device, _)| *map_device != device)
-                .map(|(_, info)| info.size)
+                .map(|(_, size)| size)
                 .sum::<usize>();
         let fs_free_space = target_fs_size - num_files * min_bucket_size; // maybe also add reserved space?
         let (expected_outcome, reason) = if target_size < device_reserved_space {
@@ -208,6 +215,8 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
                 }
             );
         }
+
+        *device_fs_sizes.get_mut(device).unwrap() = target_size;
     }
 }
 
