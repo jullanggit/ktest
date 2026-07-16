@@ -751,15 +751,19 @@ configure_kernel()
 	[[ -n $opt ]] && kernel_opt set "$opt"
     done
 
-    do_make olddefconfig
-
-    for opt in "${ktest_kernel_config_require[@]}"; do
-	[[ -n $opt ]] && kernel_opt check "$opt"
-    done
-
-    # Preserve timestamp if config didn't change:
-    if [[ -f "$kconfig".bak ]] && diff -q "$kconfig" "$kconfig".bak; then
+    # If .config had a backup and is unchanged after applying requirements,
+    # skip olddefconfig entirely to preserve timestamps on auto-generated
+    # headers (include/config/auto.conf, include/config/*.h, etc.). Running
+    # olddefconfig unconditionally retouches those files, and the subsequent
+    # do_make -k sees newer timestamps and triggers a rebuild cascade.
+    if [[ -f "$kconfig".bak ]] && diff -q "$kconfig" "$kconfig".bak >/dev/null 2>&1; then
 	mv "$kconfig".bak "$kconfig"
+    else
+	do_make olddefconfig
+
+	for opt in "${ktest_kernel_config_require[@]}"; do
+	    [[ -n $opt ]] && kernel_opt check "$opt"
+	done
     fi
 }
 
