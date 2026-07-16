@@ -8,7 +8,7 @@ use std::{
 
 use clap::Parser;
 use rand::{
-    rngs::StdRng,
+    rngs::{SmallRng, StdRng},
     seq::{index::sample, SliceRandom},
     thread_rng, Rng, RngCore, SeedableRng,
 };
@@ -132,38 +132,62 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
 
     let mut files = Vec::new();
 
-    let mut rng = StdRng::seed_from_u64(cli.seed);
+    let mut rng = SmallRng::seed_from_u64(cli.seed);
 
-    for _ in 0..cli.operations {
+    let mut num_files = 0; // will be overwritten in first iteration
+    for round in 0..cli.operations {
         let device = &cli.devices[rng.gen_range(0..cli.devices.len())];
         let device_size = device_infos[device].size;
 
         let target_size = rng.gen_range(0..((1.08 * device_size as f64) as usize));
 
-        let num_files = rng.gen_range(0..max_num_files);
-        make_num_files(
-            num_files,
-            min_bucket_size,
-            &cli.mountpoint,
-            &mut files,
-            &mut rng,
-        );
+        // expensive operation
+        if round % 10 == 0 {
+            num_files = rng.gen_range(0..max_num_files);
+            make_num_files(
+                num_files,
+                min_bucket_size,
+                &cli.mountpoint,
+                &mut files,
+                &mut rng,
+            );
+        };
 
         let device_reserved_space = 512 * device_infos[device].bucket_size;
-        let fs_free_space = {
-            let fs_space = target_size
-                + device_infos
-                    .iter()
-                    .filter(|(map_device, _)| *map_device != device)
-                    .map(|(_, info)| info.size)
-                    .sum::<usize>();
-            let used_space = num_files * min_bucket_size; // maybe also add reserved space?
-            fs_space - used_space
+        let target_fs_size = target_size
+            + device_infos
+                .iter()
+                .filter(|(map_device, _)| *map_device != device)
+                .map(|(_, info)| info.size)
+                .sum::<usize>();
+        let fs_free_space = target_fs_size - num_files * min_bucket_size; // maybe also add reserved space?
+        let (expected_outcome, reason) = if target_size < device_reserved_space {
+            (false, "less than reserved space")
+        } else if target_fs_size < fs_free_space {
+            (false, "less than fs free space")
+        } else if target_size > device_size {
+            (false, "bigger than device size")
+        } else {
+            (true, "no reason to fail")
         };
-        let expected_outcome =
-            target_size >= device_reserved_space.max(fs_free_space) && target_size <= device_size;
 
-        println!("{device} -> {target_size} ({expected_outcome})");
+        println!(
+            "{device} -> {target_size} ({})",
+            if expected_outcome {
+                "success"
+            } else {
+                "failure"
+            }
+        );
+
+        let usage = || {
+            let mut command = Command::new("bcachefs");
+            command.args(["fs", "usage"]).arg(&cli.mountpoint);
+
+            String::from_utf8(command.output().unwrap().stdout).unwrap()
+        };
+
+        let usage_before = usage();
 
         let mut command = Command::new("bcachefs");
         command
@@ -172,7 +196,17 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
 
         let result = command.output().unwrap();
         if result.status.success() != expected_outcome {
-            panic!("Unexpected outcome: {result:?}");
+            let usage_after = usage();
+            panic!(
+                "Unexpected outcome. Expected to {} because {}, but {}.\nResult: {result:?}\nUsage before: {usage_before}\nUsage after: {usage_after}",
+                if expected_outcome { "succeed" } else { "fail" },
+                reason,
+                if result.status.success() {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            );
         }
     }
 }
@@ -182,7 +216,7 @@ fn make_num_files(
     file_size: usize,
     mountpoint: &Path,
     files: &mut Vec<usize>,
-    rng: &mut StdRng,
+    rng: &mut SmallRng,
 ) {
     use std::cmp::Ordering::*;
 
@@ -194,6 +228,12 @@ fn make_num_files(
     match files.len().cmp(&num_files) {
         Less => {
             let diff = num_files - files.len();
+            println!(
+                "Add {} - total: {}",
+                diff * file_size,
+                num_files * file_size
+            );
+
             let next_num = files.iter().max().copied().unwrap_or(0) + 1;
             for num in next_num..(next_num + diff) {
                 let file_path = file_path(num);
@@ -209,6 +249,12 @@ fn make_num_files(
         Equal => {}
         Greater => {
             let diff = files.len() - num_files;
+            println!(
+                "Remove {} - total: {}",
+                diff * file_size,
+                num_files * file_size
+            );
+
             files.shuffle(rng);
             for file in files.drain(0..diff) {
                 remove_file(file_path(file)).unwrap();
