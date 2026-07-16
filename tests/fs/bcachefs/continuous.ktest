@@ -24,12 +24,15 @@ test_basic_loop()
 	"${args[@]}"					\
 	--log "$log"					\
 	--mountpoint /mnt				\
-	--operations 50 \
-	--cases 10; then
+	--operations 50; then
 	echo ":: continuous harness log"
 	cat "$log"
 	return 1
     fi
+}
+
+test_wait() {
+    sleep 1d
 }
 
 main "$@"

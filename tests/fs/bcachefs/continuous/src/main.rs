@@ -110,12 +110,6 @@ fn mount_fs(cli: &Cli) {
 }
 
 fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
-    // plan:
-    // - add data
-    //  - for now only before, not during shrinking
-    //  - random amount of data should be on fs before shrinking
-    //      - data stored as min(bucket-size)-sized files in a '/data' dir
-    //      - add / delete random files to achieve target fullness
     let min_bucket_size = device_infos
         .values()
         .map(|info| info.bucket_size)
