@@ -1,5 +1,3 @@
-#![feature(exit_status_error)]
-
 use std::{path::PathBuf, process::Command};
 
 use clap::Parser;
@@ -32,27 +30,38 @@ fn main() {
     let cli = Cli::parse();
 
     make_fs(&cli);
+    mount_fs(&cli);
     run_operations(&cli);
     offline_fsck(&cli);
 }
 
 fn make_fs(cli: &Cli) {
     let mut command = Command::new("bcachefs");
-    command.arg("format").args(&cli.devices);
+    command.arg("format").args(&cli.devices).arg("--force");
 
-    command.spawn().unwrap().wait().unwrap().exit_ok().unwrap();
+    assert!(command.spawn().unwrap().wait().unwrap().success());
+}
+
+fn mount_fs(cli: &Cli) {
+    let mut command = Command::new("bcachefs");
+    command
+        .arg("mount")
+        .arg(&cli.devices[0])
+        .arg(&cli.mountpoint);
+
+    assert!(command.spawn().unwrap().wait().unwrap().success());
 }
 
 fn run_operations(cli: &Cli) {
     let mut command = Command::new("bcachefs");
     command.args(["device", "resize", &cli.devices[0], "1G"]);
 
-    command.spawn().unwrap().wait().unwrap().exit_ok().unwrap();
+    assert!(command.spawn().unwrap().wait().unwrap().success());
 }
 
 fn offline_fsck(cli: &Cli) {
     let mut command = Command::new("bcachefs");
     command.arg("fsck").arg(&cli.mountpoint);
 
-    command.spawn().unwrap().wait().unwrap().exit_ok().unwrap();
+    assert!(command.spawn().unwrap().wait().unwrap().success());
 }
