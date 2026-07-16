@@ -1,11 +1,17 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs::{self, remove_file, File},
+    io::BufWriter,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use clap::Parser;
-use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
+use rand::{
+    rngs::StdRng,
+    seq::{index::sample, SliceRandom},
+    thread_rng, Rng, RngCore, SeedableRng,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -104,14 +110,58 @@ fn mount_fs(cli: &Cli) {
 }
 
 fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
+    // plan:
+    // - add data
+    //  - for now only before, not during shrinking
+    //  - random amount of data should be on fs before shrinking
+    //      - data stored as min(bucket-size)-sized files in a '/data' dir
+    //      - add / delete random files to achieve target fullness
+    let min_bucket_size = device_infos
+        .values()
+        .map(|info| info.bucket_size)
+        .min()
+        .unwrap();
+    let reserved_space = device_infos
+        .values()
+        .map(|info| info.bucket_size)
+        .sum::<usize>()
+        * 512;
+    let max_num_files = (device_infos.values().map(|info| info.size).sum::<usize>()
+        - reserved_space)
+        / min_bucket_size;
+
+    let mut files = Vec::new();
+
     let mut rng = StdRng::seed_from_u64(cli.seed);
+
     for _ in 0..cli.operations {
         let device = &cli.devices[rng.gen_range(0..cli.devices.len())];
         let device_size = device_infos[device].size;
 
         let target_size = rng.gen_range(0..((1.08 * device_size as f64) as usize));
+
+        let num_files = rng.gen_range(0..max_num_files);
+        make_num_files(
+            num_files,
+            min_bucket_size,
+            &cli.mountpoint,
+            &mut files,
+            &mut rng,
+        );
+
+        let device_reserved_space = 512 * device_infos[device].bucket_size;
+        let fs_free_space = {
+            let fs_space = target_size
+                + device_infos
+                    .iter()
+                    .filter(|(map_device, _)| *map_device != device)
+                    .map(|(_, info)| info.size)
+                    .sum::<usize>();
+            let used_space = num_files * min_bucket_size; // maybe also add reserved space?
+            fs_space - used_space
+        };
         let expected_outcome =
-            target_size >= 512 * device_infos[device].bucket_size && target_size <= device_size;
+            target_size >= device_reserved_space.max(fs_free_space) && target_size <= device_size;
 
         println!("{device} -> {target_size} ({expected_outcome})");
 
@@ -123,6 +173,46 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
         let result = command.output().unwrap();
         if result.status.success() != expected_outcome {
             panic!("Unexpected outcome: {result:?}");
+        }
+    }
+}
+
+fn make_num_files(
+    num_files: usize,
+    file_size: usize,
+    mountpoint: &Path,
+    files: &mut Vec<usize>,
+    rng: &mut StdRng,
+) {
+    use std::cmp::Ordering::*;
+
+    let file_path = |num: usize| {
+        let mut path = mountpoint.to_path_buf();
+        path.push(num.to_string());
+        path
+    };
+    match files.len().cmp(&num_files) {
+        Less => {
+            let diff = num_files - files.len();
+            let next_num = files.iter().max().copied().unwrap_or(0) + 1;
+            for num in next_num..(next_num + diff) {
+                let file_path = file_path(num);
+
+                let mut data = vec![0u8; file_size];
+                rng.fill_bytes(&mut data);
+
+                fs::write(file_path, data).unwrap();
+
+                files.push(num);
+            }
+        }
+        Equal => {}
+        Greater => {
+            let diff = files.len() - num_files;
+            files.shuffle(rng);
+            for file in files.drain(0..diff) {
+                remove_file(file_path(file)).unwrap();
+            }
         }
     }
 }
