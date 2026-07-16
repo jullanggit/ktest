@@ -33,8 +33,8 @@ struct Cli {
     operations: usize,
 
     /// Deterministic seed for operation scheduling.
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 fn main() {
@@ -134,7 +134,9 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
 
     let mut files = Vec::new();
 
-    let mut rng = SmallRng::seed_from_u64(cli.seed);
+    let seed = cli.seed.unwrap_or_else(|| thread_rng().gen());
+    println!("Using seed: {seed}");
+    let mut rng = SmallRng::seed_from_u64(seed);
 
     let mut num_files = 0; // will be overwritten in first iteration
     for round in 0..cli.operations {
