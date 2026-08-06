@@ -374,6 +374,7 @@ fn make_num_files(
 
 /// wait for reconcile to finish
 fn wait_for_reconcile(mountpoint: &Path) {
+    // TODO: automatically trigger reconcile by writing I/O, if it would otherwise be waiting for it
     assert!(Command::new("bcachefs")
         .args(["reconcile", "wait"])
         .arg(mountpoint)
