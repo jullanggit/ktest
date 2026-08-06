@@ -187,7 +187,7 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
 
         let usage = || {
             let mut command = Command::new("bcachefs");
-            command.args(["fs", "usage"]).arg(&cli.mountpoint);
+            command.args(["fs", "usage", "-h"]).arg(&cli.mountpoint);
 
             String::from_utf8(command.output().unwrap().stdout).unwrap()
         };
