@@ -60,7 +60,9 @@ fn make_fs(cli: &Cli) -> HashMap<String, DeviceInfo> {
     command.arg("format").args(&cli.devices).arg("--force");
 
     let output = command.output().unwrap();
-    assert!(output.status.success());
+    if !output.status.success() {
+        panic!("{output:?}");
+    }
 
     String::from_utf8(output.stdout)
         .unwrap()
