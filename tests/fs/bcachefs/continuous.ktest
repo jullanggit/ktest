@@ -4,8 +4,9 @@
 
 require-make continuous
 
-config-scratch-devs 4G
+config-scratch-devs 3G
 config-scratch-devs 2G
+config-scratch-devs 1G
 config-scratch-devs 1G
 
 test_basic_loop()
