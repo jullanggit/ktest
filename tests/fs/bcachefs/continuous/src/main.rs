@@ -189,12 +189,39 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
         let device_size = device_infos[device].size;
 
         let target_size = rng.gen_range(0..((1.08 * device_size as f64) as usize)); // TODO: actually use buckets here as that is the atomic space unit used
+        let target_device_fs_sizes = device_fs_sizes
+            .iter()
+            .map(|(map_device, size)| {
+                (
+                    map_device.clone(),
+                    if map_device == { device } {
+                        target_size
+                    } else {
+                        *size
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         // expensive operation
         if round % 10 == 0 {
+            let mut sorted_device_fs_sizes =
+                target_device_fs_sizes.values().cloned().collect::<Vec<_>>();
+            sorted_device_fs_sizes.sort();
+
+            let max_data = (0..replicas)
+                .map(|excluded| {
+                    (0..sorted_device_fs_sizes.len() - excluded)
+                        .map(|i| sorted_device_fs_sizes[i])
+                        .sum::<usize>()
+                        / (replicas - excluded)
+                })
+                .min()
+                .unwrap()
+                - reserved_space;
+
             let max_num_files = (0.90 // don't over-fill fs - causes deadlocks
-                * (device_fs_sizes.values().sum::<usize>() - reserved_space) as f64)
-                as usize
+                * max_data as f64) as usize
                 / (min_bucket_size * replicas);
 
             num_files = rng.gen_range(0..max_num_files);
@@ -215,15 +242,9 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
             let mut datas = vec![num_files * min_bucket_size; replicas];
             let mut datas_i = 0;
 
-            for mut device_size in device_fs_sizes.iter().map(|(map_device, size)| {
-                if map_device == { device } {
-                    target_size
-                } else {
-                    *size
-                }
-            }) {
-                let usable_size = device_size.min(num_files * min_bucket_size); // only one full copy can be on a device
+            for mut device_size in target_device_fs_sizes.values().cloned() {
                 loop {
+                    let usable_size = device_size.min(num_files * min_bucket_size); // only one full copy can be on a device
                     if datas[datas_i] <= usable_size {
                         device_size -= datas[datas_i];
                         datas[datas_i] = 0;
