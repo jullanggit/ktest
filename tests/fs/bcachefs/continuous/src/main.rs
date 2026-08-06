@@ -165,11 +165,11 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
                 .filter(|(map_device, _)| *map_device != device)
                 .map(|(_, size)| size)
                 .sum::<usize>();
-        let fs_free_space = target_fs_size - num_files * min_bucket_size; // maybe also add reserved space?
         let (expected_outcome, reason) = if target_size < device_reserved_space {
             (false, "less than reserved space")
-        } else if target_fs_size < fs_free_space {
-            (false, "less than fs free space")
+        // maybe also add reserved space?
+        } else if target_fs_size < num_files * min_bucket_size {
+            (false, "less than stored data")
         } else if target_size > device_size {
             (false, "bigger than device size")
         } else {
