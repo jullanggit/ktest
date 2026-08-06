@@ -173,7 +173,7 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
 
         // expensive operation
         if round % 10 == 0 {
-            let max_num_files = (0.95 // don't over-fill fs - causes deadlocks
+            let max_num_files = (0.90 // don't over-fill fs - causes deadlocks
                 * (device_fs_sizes.values().sum::<usize>() - reserved_space) as f64)
                 as usize
                 / (min_bucket_size * replicas);
@@ -191,19 +191,11 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
             String::from_utf8(command.output().unwrap().stdout).unwrap()
         };
 
-        let usage_before = usage();
-        let online_reserved = usage_before
-            .lines()
-            .find_map(|line| line.strip_prefix("Online reserved:"))
-            .map(human_size_to_bytes)
-            .unwrap();
-
         let enough_space_for_data = 'label: {
             // very handrolled and probably weird replica allocation algorithm
             let mut datas = vec![num_files * min_bucket_size; replicas];
-            datas.push(online_reserved);
-
             let mut datas_i = 0;
+
             for mut device_size in device_fs_sizes.iter().map(|(map_device, size)| {
                 if map_device == { device } {
                     target_size
@@ -213,19 +205,13 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
             }) {
                 let usable_size = device_size.min(num_files * min_bucket_size); // only one full copy can be on a device
                 loop {
-                    dbg!(&datas, device_size);
                     if datas[datas_i] <= usable_size {
                         device_size -= datas[datas_i];
                         datas[datas_i] = 0;
 
-                        // allow using spare capacity for online_reserved
-                        let online_reserved_i = datas.len() - 1;
-                        datas[online_reserved_i] =
-                            datas[online_reserved_i].saturating_sub(device_size);
-
                         if datas_i < datas.len() - 1 {
                             datas_i += 1;
-                        } else if datas[online_reserved_i] == 0 {
+                        } else {
                             break 'label true;
                         }
                     } else {
@@ -235,7 +221,6 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
                 }
             }
             let remaining: usize = datas.iter().sum();
-            dbg!(remaining);
             false
         };
         let (expected_outcome, reason) = if target_size < device_reserved_space {
@@ -257,6 +242,8 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
                 "failure"
             }
         );
+
+        let usage_before = usage();
 
         let mut command = Command::new("bcachefs");
         command
