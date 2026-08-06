@@ -130,6 +130,25 @@ fn human_size_to_bytes(size: &str) -> usize {
         * factor) as usize
 }
 
+fn bytes_to_human_size(size: usize) -> String {
+    let mut size = size as f64;
+    let mut unit = 'B';
+    for u in ['k', 'M', 'G', 'T'] {
+        if size < 1024. {
+            break;
+        }
+        size /= 1024.;
+        unit = u;
+    }
+    if size < 10. {
+        format!("{:.2}{}", size, unit)
+    } else if size < 100. {
+        format!("{:.1}{}", size, unit)
+    } else {
+        format!("{:.0}{}", size, unit)
+    }
+}
+
 fn mount_fs(cli: &Cli) {
     let mut command = Command::new("bcachefs");
     command
@@ -235,7 +254,8 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
         };
 
         println!(
-            "{device} -> {target_size} ({})",
+            "{device} -> {} ({})",
+            bytes_to_human_size(target_size),
             if expected_outcome {
                 "success"
             } else {
@@ -290,8 +310,8 @@ fn make_num_files(
             let diff = num_files - files.len();
             println!(
                 "Add {} - total: {}",
-                diff * file_size,
-                num_files * file_size
+                bytes_to_human_size(diff * file_size),
+                bytes_to_human_size(num_files * file_size)
             );
 
             let next_num = files.iter().max().copied().unwrap_or(0) + 1;
@@ -311,8 +331,8 @@ fn make_num_files(
             let diff = files.len() - num_files;
             println!(
                 "Remove {} - total: {}",
-                diff * file_size,
-                num_files * file_size
+                bytes_to_human_size(diff * file_size),
+                bytes_to_human_size(num_files * file_size)
             );
 
             files.shuffle(rng);
