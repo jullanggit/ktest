@@ -214,7 +214,9 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
             );
         }
 
-        *device_fs_sizes.get_mut(device).unwrap() = target_size;
+        if result.status.success() {
+            *device_fs_sizes.get_mut(device).unwrap() = target_size;
+        }
     }
 }
 
