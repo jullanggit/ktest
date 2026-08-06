@@ -9,15 +9,16 @@ config-scratch-devs 2G
 config-scratch-devs 1G
 config-scratch-devs 1G
 
-test_basic_loop()
+run_continuous_test()
 {
+    local num_devs="$1"
     local args=()
     local dev
-    local log="$ktest_out/continuous-basic.log"
+    local log="$ktest_out/continuous-basic-${num_devs}dev.log"
 
-    set_watchdog 180
-
-    for dev in "${ktest_scratch_dev[@]}"; do
+    echo ":: continuous harness: ${num_devs} devices"
+    args=()
+    for dev in "${ktest_scratch_dev[@]:0:${num_devs}}"; do
 	args+=(--device "$dev")
     done
 
@@ -26,13 +27,25 @@ test_basic_loop()
 	--log "$log"					\
 	--mountpoint /mnt				\
 	--operations 50; then
-	echo ":: continuous harness log"
+	echo ":: continuous harness log (${num_devs} devices)"
 	cat "$log"
 	return 1
     fi
 }
 
-test_wait() {
+test_three_devices()
+{
+    set_watchdog 180
+    run_continuous_test 3
+}
+
+test_four_devices()
+{
+    set_watchdog 180
+    run_continuous_test 4
+}
+
+_test_wait() {
     sleep 1d
 }
 
