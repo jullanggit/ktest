@@ -239,7 +239,6 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
                     }
                 }
             }
-            let remaining: usize = datas.iter().sum();
             false
         };
         let (expected_outcome, reason) = if target_size < device_reserved_space {
@@ -288,6 +287,8 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
         if result.status.success() {
             *device_fs_sizes.get_mut(device).unwrap() = target_size;
         }
+
+        wait_for_reconcile(&cli.mountpoint);
     }
 }
 
@@ -341,8 +342,11 @@ fn make_num_files(
             }
         }
     }
+    wait_for_reconcile(mountpoint);
+}
 
-    // wait for reconcile to finish
+/// wait for reconcile to finish
+fn wait_for_reconcile(mountpoint: &Path) {
     assert!(Command::new("bcachefs")
         .args(["reconcile", "wait"])
         .arg(mountpoint)
