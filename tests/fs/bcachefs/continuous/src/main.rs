@@ -170,11 +170,6 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
         .map(|info| info.bucket_size)
         .min()
         .unwrap();
-    let reserved_space = device_infos
-        .values()
-        .map(|info| info.bucket_size)
-        .sum::<usize>()
-        * 512;
 
     let mut device_fs_sizes = device_infos
         .iter()
@@ -203,13 +198,12 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
             })
             .collect::<HashMap<_, _>>();
 
-        // expensive operation
-        if round % 10 == 0 {
+        let max_data = {
             let mut sorted_device_fs_sizes =
                 target_device_fs_sizes.values().cloned().collect::<Vec<_>>();
             sorted_device_fs_sizes.sort();
 
-            let max_data = (0..replicas)
+            (0..replicas)
                 .map(|excluded| {
                     (0..sorted_device_fs_sizes.len() - excluded)
                         .map(|i| sorted_device_fs_sizes[i])
@@ -218,9 +212,11 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
                 })
                 .min()
                 .unwrap()
-                - reserved_space;
+        };
 
-            let max_num_files = (0.90 // don't over-fill fs - causes deadlocks
+        // expensive operation
+        if round % 10 == 0 {
+            let max_num_files = (0.92 // don't over-fill fs so we don't run into any nondeterministic resizes
                 * max_data as f64) as usize
                 / (min_bucket_size * replicas);
 
@@ -237,35 +233,10 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
             String::from_utf8(command.output().unwrap().stdout).unwrap()
         };
 
-        let enough_space_for_data = 'label: {
-            // very handrolled and probably weird replica allocation algorithm
-            let mut datas = vec![num_files * min_bucket_size; replicas];
-            let mut datas_i = 0;
-
-            for mut device_size in target_device_fs_sizes.values().cloned() {
-                loop {
-                    let usable_size = device_size.min(num_files * min_bucket_size); // only one full copy can be on a device
-                    if datas[datas_i] <= usable_size {
-                        device_size -= datas[datas_i];
-                        datas[datas_i] = 0;
-
-                        if datas_i < datas.len() - 1 {
-                            datas_i += 1;
-                        } else {
-                            break 'label true;
-                        }
-                    } else {
-                        datas[datas_i] -= usable_size;
-                        break;
-                    }
-                }
-            }
-            false
-        };
         let (expected_outcome, reason) = if target_size < device_reserved_space {
             (false, "less than reserved space")
         // maybe also add reserved space?
-        } else if !enough_space_for_data {
+        } else if num_files * min_bucket_size > max_data {
             (false, "not enough space for data")
         } else if target_size > device_size {
             (false, "bigger than device size")
