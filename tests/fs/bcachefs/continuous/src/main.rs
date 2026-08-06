@@ -1,3 +1,12 @@
+// TODO
+// - Replicas (on it)
+// - Erasure coding
+// - Device add / remove
+// - All other fs options
+// - Concurrent load
+// - Changing (changeable) fs options mid-run & mid-shrink
+// - Mixing per-file options
+
 use std::{
     collections::HashMap,
     fs::{self, remove_file, File},
@@ -40,11 +49,21 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let device_infos = make_fs(&cli);
+    let seed = cli.seed.unwrap_or_else(|| thread_rng().gen());
+    println!("Using seed: {seed}");
+    let mut rng = SmallRng::seed_from_u64(seed);
+
+    let fs_info = make_fs(&cli, &mut rng);
     mount_fs(&cli);
-    run_operations(&cli, device_infos);
+    run_operations(&cli, fs_info, &mut rng);
     fsck(&cli);
     unmount_fs(&cli);
+}
+
+#[derive(Debug)]
+struct FsInfo {
+    device_infos: HashMap<String, DeviceInfo>,
+    replicas: usize,
 }
 
 #[derive(Debug)]
@@ -55,35 +74,45 @@ struct DeviceInfo {
     bucket_size: usize,
 }
 
-fn make_fs(cli: &Cli) -> HashMap<String, DeviceInfo> {
+fn make_fs(cli: &Cli, rng: &mut SmallRng) -> FsInfo {
+    let replicas = rng.gen_range(1..=cli.devices.len());
+    println!("replicas = {replicas}");
+
     let mut command = Command::new("bcachefs");
-    command.arg("format").args(&cli.devices).arg("--force");
+    command
+        .arg("format")
+        .args(&cli.devices)
+        .arg("--force")
+        .arg(format!("--replicas={replicas}"));
 
     let output = command.output().unwrap();
     if !output.status.success() {
         panic!("{output:?}");
     }
 
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .split("\nDevice ")
-        .skip(2)
-        .map(|str| {
-            let (mut device, mut size, mut bucket_size) = ("", 0, 0);
-            str.lines().for_each(|line| {
-                let (field, value) = line.split_once(':').unwrap();
-                match field.trim() {
-                    "Size" => size = human_size_to_bytes(value),
-                    "Bucket size" => bucket_size = human_size_to_bytes(value),
-                    other if other.parse::<usize>().is_ok() => {
-                        device = value.split_once('\t').unwrap().0.trim()
+    FsInfo {
+        replicas,
+        device_infos: String::from_utf8(output.stdout)
+            .unwrap()
+            .split("\nDevice ")
+            .skip(2)
+            .map(|str| {
+                let (mut device, mut size, mut bucket_size) = ("", 0, 0);
+                str.lines().for_each(|line| {
+                    let (field, value) = line.split_once(':').unwrap();
+                    match field.trim() {
+                        "Size" => size = human_size_to_bytes(value),
+                        "Bucket size" => bucket_size = human_size_to_bytes(value),
+                        other if other.parse::<usize>().is_ok() => {
+                            device = value.split_once('\t').unwrap().0.trim()
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            });
-            (device.to_string(), DeviceInfo { size, bucket_size })
-        })
-        .collect()
+                });
+                (device.to_string(), DeviceInfo { size, bucket_size })
+            })
+            .collect(),
+    }
 }
 
 fn human_size_to_bytes(size: &str) -> usize {
@@ -111,7 +140,12 @@ fn mount_fs(cli: &Cli) {
     assert!(command.spawn().unwrap().wait().unwrap().success());
 }
 
-fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
+fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
+    let FsInfo {
+        device_infos,
+        replicas,
+    } = fs_info;
+
     let min_bucket_size = device_infos
         .values()
         .map(|info| info.bucket_size)
@@ -130,10 +164,6 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
 
     let mut files = Vec::new();
 
-    let seed = cli.seed.unwrap_or_else(|| thread_rng().gen());
-    println!("Using seed: {seed}");
-    let mut rng = SmallRng::seed_from_u64(seed);
-
     let mut num_files = 0; // will be overwritten in first iteration
     for round in 0..cli.operations {
         let device = &cli.devices[rng.gen_range(0..cli.devices.len())];
@@ -146,30 +176,73 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
             let max_num_files = (0.95 // don't over-fill fs - causes deadlocks
                 * (device_fs_sizes.values().sum::<usize>() - reserved_space) as f64)
                 as usize
-                / min_bucket_size;
+                / (min_bucket_size * replicas);
 
             num_files = rng.gen_range(0..max_num_files);
-            make_num_files(
-                num_files,
-                min_bucket_size,
-                &cli.mountpoint,
-                &mut files,
-                &mut rng,
-            );
+            make_num_files(num_files, min_bucket_size, &cli.mountpoint, &mut files, rng);
         };
 
         let device_reserved_space = 512 * device_infos[device].bucket_size;
-        let target_fs_size = target_size
-            + device_fs_sizes
-                .iter()
-                .filter(|(map_device, _)| *map_device != device)
-                .map(|(_, size)| size)
-                .sum::<usize>();
+
+        let usage = || {
+            let mut command = Command::new("bcachefs");
+            command.args(["fs", "usage", "-h"]).arg(&cli.mountpoint);
+
+            String::from_utf8(command.output().unwrap().stdout).unwrap()
+        };
+
+        let usage_before = usage();
+        let online_reserved = usage_before
+            .lines()
+            .find_map(|line| line.strip_prefix("Online reserved:"))
+            .map(human_size_to_bytes)
+            .unwrap();
+
+        let enough_space_for_data = 'label: {
+            // very handrolled and probably weird replica allocation algorithm
+            let mut datas = vec![num_files * min_bucket_size; replicas];
+            datas.push(online_reserved);
+
+            let mut datas_i = 0;
+            for mut device_size in device_fs_sizes.iter().map(|(map_device, size)| {
+                if map_device == { device } {
+                    target_size
+                } else {
+                    *size
+                }
+            }) {
+                let usable_size = device_size.min(num_files * min_bucket_size); // only one full copy can be on a device
+                loop {
+                    dbg!(&datas, device_size);
+                    if datas[datas_i] <= usable_size {
+                        device_size -= datas[datas_i];
+                        datas[datas_i] = 0;
+
+                        // allow using spare capacity for online_reserved
+                        let online_reserved_i = datas.len() - 1;
+                        datas[online_reserved_i] =
+                            datas[online_reserved_i].saturating_sub(device_size);
+
+                        if datas_i < datas.len() - 1 {
+                            datas_i += 1;
+                        } else if datas[online_reserved_i] == 0 {
+                            break 'label true;
+                        }
+                    } else {
+                        datas[datas_i] -= usable_size;
+                        break;
+                    }
+                }
+            }
+            let remaining: usize = datas.iter().sum();
+            dbg!(remaining);
+            false
+        };
         let (expected_outcome, reason) = if target_size < device_reserved_space {
             (false, "less than reserved space")
         // maybe also add reserved space?
-        } else if target_fs_size < num_files * min_bucket_size {
-            (false, "less than stored data")
+        } else if !enough_space_for_data {
+            (false, "not enough space for data")
         } else if target_size > device_size {
             (false, "bigger than device size")
         } else {
@@ -184,15 +257,6 @@ fn run_operations(cli: &Cli, device_infos: HashMap<String, DeviceInfo>) {
                 "failure"
             }
         );
-
-        let usage = || {
-            let mut command = Command::new("bcachefs");
-            command.args(["fs", "usage", "-h"]).arg(&cli.mountpoint);
-
-            String::from_utf8(command.output().unwrap().stdout).unwrap()
-        };
-
-        let usage_before = usage();
 
         let mut command = Command::new("bcachefs");
         command
@@ -270,6 +334,18 @@ fn make_num_files(
             }
         }
     }
+
+    // wait for reconcile to finish
+    assert!(Command::new("bcachefs")
+        .args(["reconcile", "wait"])
+        .arg(mountpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap()
+        .success());
 }
 
 fn fsck(cli: &Cli) {
