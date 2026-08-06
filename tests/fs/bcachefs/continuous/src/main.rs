@@ -63,6 +63,7 @@ fn main() {
 #[derive(Debug)]
 struct FsInfo {
     device_infos: HashMap<String, DeviceInfo>,
+    ec: bool,
     replicas: usize,
 }
 
@@ -75,15 +76,32 @@ struct DeviceInfo {
 }
 
 fn make_fs(cli: &Cli, rng: &mut SmallRng) -> FsInfo {
-    let replicas = rng.gen_range(1..=cli.devices.len());
+    let ec: bool = rng.gen();
+    println!("ec = {ec}");
+
+    let max_replicas = if ec {
+        (cli.devices.len() - 1).min(3) // fault tolerance of ec replicas = normal replicas + 1
+    } else {
+        cli.devices.len()
+    };
+    let replicas = rng.gen_range(1..=max_replicas);
     println!("replicas = {replicas}");
 
     let mut command = Command::new("bcachefs");
     command
         .arg("format")
-        .args(&cli.devices)
         .arg("--force")
         .arg(format!("--replicas={replicas}"));
+    if ec {
+        command.arg("--erasure_code");
+        for dev in &cli.devices {
+            // force equal bucket sizes to make stripes be able to allocate across all devices.
+            // TODO: allow different bucket sizes - would require more complicated capacity calculations
+            command.arg("--bucket_size=512k").arg(dev);
+        }
+    } else {
+        command.args(&cli.devices);
+    }
 
     let output = command.output().unwrap();
     if !output.status.success() {
@@ -91,6 +109,7 @@ fn make_fs(cli: &Cli, rng: &mut SmallRng) -> FsInfo {
     }
 
     FsInfo {
+        ec,
         replicas,
         device_infos: String::from_utf8(output.stdout)
             .unwrap()
@@ -163,6 +182,7 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
     let FsInfo {
         device_infos,
         replicas,
+        ec,
     } = fs_info;
 
     let min_bucket_size = device_infos
@@ -203,7 +223,21 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
                 target_device_fs_sizes.values().cloned().collect::<Vec<_>>();
             sorted_device_fs_sizes.sort();
 
-            (0..replicas)
+            let (replicas, overhead) = if ec {
+                (
+                    sorted_device_fs_sizes.len(), // full-width stripes
+                    // overhead relative to full redundancy
+                    {
+                        let n = sorted_device_fs_sizes.len() as f64;
+                        let p = replicas as f64;
+                        p * (n - p + 1.) / n
+                    },
+                )
+            } else {
+                (replicas, 1.)
+            };
+
+            ((0..replicas)
                 .map(|excluded| {
                     (0..sorted_device_fs_sizes.len() - excluded)
                         .map(|i| sorted_device_fs_sizes[i])
@@ -211,7 +245,8 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
                         / (replicas - excluded)
                 })
                 .min()
-                .unwrap()
+                .unwrap() as f64
+                * overhead) as usize
         };
 
         // expensive operation
