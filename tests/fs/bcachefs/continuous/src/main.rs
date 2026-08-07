@@ -293,7 +293,7 @@ fn run_operations(cli: &Cli, fs_info: FsInfo, rng: &mut SmallRng) {
 
         let mut command = Command::new("bcachefs");
         command
-            .args(["device", "resize", device])
+            .args(["device", "resize", "--shrink", device])
             .arg(format!("{target_size}B"));
 
         let result = command.output().unwrap();
